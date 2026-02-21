@@ -1,15 +1,15 @@
 [package]
 name = "lumora"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.78"
-description = "Offline semantic code graph, watcher daemon, and MCP server for local repositories"
+description = "Local semantic code graph and MCP server for AI coding agents"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/quintant/lumora"
 homepage = "https://github.com/quintant/lumora"
 documentation = "https://docs.rs/lumora"
-keywords = ["code-intelligence", "mcp", "tree-sitter", "code-search", "cli"]
+keywords = ["mcp", "code-graph", "semantic-search", "ai-agents", "code-intelligence"]
 categories = ["command-line-utilities", "development-tools", "parser-implementations"]
 exclude = [
     ".codex/**",

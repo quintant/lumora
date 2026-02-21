@@ -248,20 +248,7 @@ fn resolve_single_import(
     }
 
     let candidates: Vec<PathBuf> = match language {
-        LanguageKind::Rust => {
-            let module_path = normalized_module
-                .trim_start_matches("crate::")
-                .trim_start_matches("self::")
-                .trim_start_matches("super::")
-                .replace("::", "/");
-            if module_path.is_empty() {
-                return None;
-            }
-            vec![
-                PathBuf::from("src").join(format!("{module_path}.rs")),
-                PathBuf::from("src").join(module_path).join("mod.rs"),
-            ]
-        }
+        LanguageKind::Rust => rust_import_candidates(normalized_module),
         LanguageKind::Python => {
             let module_path = normalized_module.replace('.', "/");
             if module_path.is_empty() {
@@ -295,6 +282,54 @@ fn resolve_single_import(
     }
 
     None
+}
+
+fn rust_import_candidates(raw_module: &str) -> Vec<PathBuf> {
+    // Keep only the stable module prefix from `use` shapes like:
+    // - crate::mcp::run_mcp_stdio
+    // - crate::indexer::{index_repository, IndexOptions}
+    // - crate::storage::GraphStore as Store
+    let mut module = raw_module.trim();
+
+    if let Some((prefix, _)) = module.split_once('{') {
+        module = prefix;
+    }
+    if let Some((prefix, _)) = module.split_once(" as ") {
+        module = prefix;
+    }
+    module = module.trim().trim_end_matches("::");
+
+    let mut parts: Vec<&str> = module
+        .split("::")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    while matches!(parts.first().copied(), Some("crate" | "self" | "super")) {
+        parts.remove(0);
+    }
+
+    if parts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Try increasingly broader prefixes so symbol imports still resolve to module files.
+    for len in (1..=parts.len()).rev() {
+        let prefix = parts[..len].join("/");
+        let file_candidate = PathBuf::from("src").join(format!("{prefix}.rs"));
+        let mod_candidate = PathBuf::from("src").join(prefix).join("mod.rs");
+
+        if seen.insert(file_candidate.clone()) {
+            out.push(file_candidate);
+        }
+        if seen.insert(mod_candidate.clone()) {
+            out.push(mod_candidate);
+        }
+    }
+
+    out
 }
 
 fn build_winnowed_fingerprints(content: &str, k: usize, window: usize) -> Vec<(i64, i64, i64)> {

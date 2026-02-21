@@ -110,6 +110,10 @@ pub struct ReferenceLocation {
     pub line: i64,
     pub col: i64,
     pub edge_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +140,12 @@ pub struct RelatedEdge {
     pub edge_type: String,
     pub direction: String,
     pub entity: Entity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,4 +153,33 @@ pub struct CloneMatch {
     pub other_file: String,
     pub shared_fingerprints: i64,
     pub similarity: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopFileSummary {
+    pub file_path: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectorSuggestion {
+    pub entity_type: String,
+    pub key: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CloneHotspot {
+    pub directory: String,
+    pub files: i64,
+    pub avg_similarity: f64,
+    pub max_similarity: f64,
 }

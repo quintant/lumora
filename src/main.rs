@@ -6,7 +6,7 @@ mod parser;
 mod paths;
 mod storage;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -17,7 +17,9 @@ use serde_json::json;
 use crate::indexer::{index_repository, IndexOptions};
 use crate::mcp::run_mcp_stdio;
 use crate::paths::{ensure_state_layout, resolve_runtime_paths, RuntimePaths};
-use crate::storage::GraphStore;
+use crate::storage::{
+    CloneQueryOptions, GraphStore, ReferenceQueryOptions, SliceQueryOptions, SortOrder,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "lumora")]
@@ -90,12 +92,14 @@ struct QueryArgs {
 #[derive(Debug, Args)]
 struct McpArgs {
     #[arg(long, default_value = ".")]
-    repo: PathBuf,
+    repo: String,
+    #[arg(hide = true)]
+    repo_tail: Vec<String>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long)]
     db: Option<PathBuf>,
-    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
     auto_index: bool,
     #[arg(long)]
     full_first: bool,
@@ -136,9 +140,43 @@ enum QueryCommands {
         name: String,
         #[arg(long)]
         calls_only: bool,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        dedup: bool,
+        #[arg(long, default_value = "score_desc")]
+        order: String,
+        #[arg(long)]
+        file_glob: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        max_age_hours: Option<u64>,
+        #[arg(long)]
+        top_files: bool,
     },
     /// Find call sites for a symbol.
-    Callers { name: String },
+    Callers {
+        name: String,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        dedup: bool,
+        #[arg(long, default_value = "score_desc")]
+        order: String,
+        #[arg(long)]
+        file_glob: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        max_age_hours: Option<u64>,
+        #[arg(long)]
+        top_files: bool,
+    },
     /// Find dependency path A -> B using graph edges.
     Deps {
         from: String,
@@ -153,12 +191,28 @@ enum QueryCommands {
         line: Option<i64>,
         #[arg(long, default_value_t = 2)]
         depth: usize,
+        #[arg(long, default_value_t = 40)]
+        max_neighbors: usize,
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        dedup: bool,
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        suppress_low_signal_repeats: bool,
+        #[arg(long, default_value_t = 1)]
+        low_signal_name_cap: usize,
+        #[arg(long, default_value_t = true, action = ArgAction::Set)]
+        prefer_project_symbols: bool,
     },
     /// Find similar files by token-winnowing fingerprints.
     Clones {
         file: String,
-        #[arg(long, default_value_t = 0.2)]
+        #[arg(long, default_value_t = 0.02)]
         min_similarity: f64,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long)]
+        hotspots: bool,
     },
 }
 
@@ -236,35 +290,111 @@ fn run_query(args: QueryArgs) -> Result<()> {
                 }
             }
         }
-        QueryCommands::Refs { name, calls_only } => {
-            let rows = if calls_only {
-                store.symbol_references(&name, Some("calls"))?
+        QueryCommands::Refs {
+            name,
+            calls_only,
+            limit,
+            offset,
+            dedup,
+            order,
+            file_glob,
+            language,
+            max_age_hours,
+            top_files,
+        } => {
+            let edge_type_filter = if calls_only {
+                Some("calls".to_string())
             } else {
-                store.symbol_references(&name, None)?
+                None
             };
+            let options = ReferenceQueryOptions {
+                edge_type_filter,
+                file_glob,
+                language,
+                max_age_hours,
+                limit: limit.max(1),
+                offset,
+                dedup,
+                order: parse_sort_order(&order)?,
+            };
+            let (rows, pagination) = store.symbol_references_page(&name, &options)?;
 
             if args.json {
-                print_json(&rows)?;
+                print_json(&json!({
+                    "rows": rows,
+                    "pagination": pagination
+                }))?;
             } else if rows.is_empty() {
                 println!("No references found for `{name}`");
             } else {
-                for row in rows {
-                    println!(
-                        "{}:{}:{} [{}]",
-                        row.file_path, row.line, row.col, row.edge_type
-                    );
+                for row in &rows {
+                    if let Some(score) = row.score {
+                        println!(
+                            "{}:{}:{} [{}] score={:.2}",
+                            row.file_path, row.line, row.col, row.edge_type, score
+                        );
+                    } else {
+                        println!(
+                            "{}:{}:{} [{}]",
+                            row.file_path, row.line, row.col, row.edge_type
+                        );
+                    }
+                }
+                if top_files {
+                    let summary = store.top_reference_files(&rows, 10);
+                    println!("top files:");
+                    for item in summary {
+                        println!("  {} ({})", item.file_path, item.count);
+                    }
                 }
             }
         }
-        QueryCommands::Callers { name } => {
-            let rows = store.symbol_references(&name, Some("calls"))?;
+        QueryCommands::Callers {
+            name,
+            limit,
+            offset,
+            dedup,
+            order,
+            file_glob,
+            language,
+            max_age_hours,
+            top_files,
+        } => {
+            let options = ReferenceQueryOptions {
+                edge_type_filter: Some("calls".to_string()),
+                file_glob,
+                language,
+                max_age_hours,
+                limit: limit.max(1),
+                offset,
+                dedup,
+                order: parse_sort_order(&order)?,
+            };
+            let (rows, pagination) = store.symbol_references_page(&name, &options)?;
             if args.json {
-                print_json(&rows)?;
+                print_json(&json!({
+                    "rows": rows,
+                    "pagination": pagination
+                }))?;
             } else if rows.is_empty() {
                 println!("No callers found for `{name}`");
             } else {
-                for row in rows {
-                    println!("{}:{}:{}", row.file_path, row.line, row.col);
+                for row in &rows {
+                    if let Some(score) = row.score {
+                        println!(
+                            "{}:{}:{} score={:.2}",
+                            row.file_path, row.line, row.col, score
+                        );
+                    } else {
+                        println!("{}:{}:{}", row.file_path, row.line, row.col);
+                    }
+                }
+                if top_files {
+                    let summary = store.top_reference_files(&rows, 10);
+                    println!("top caller files:");
+                    for item in summary {
+                        println!("  {} ({})", item.file_path, item.count);
+                    }
                 }
             }
         }
@@ -284,8 +414,28 @@ fn run_query(args: QueryArgs) -> Result<()> {
                 }
             }
         }
-        QueryCommands::Slice { file, line, depth } => {
-            let result = store.minimal_slice(&file, line, depth.max(1))?;
+        QueryCommands::Slice {
+            file,
+            line,
+            depth,
+            max_neighbors,
+            dedup,
+            suppress_low_signal_repeats,
+            low_signal_name_cap,
+            prefer_project_symbols,
+        } => {
+            let result = store.minimal_slice_with_options(
+                &file,
+                line,
+                depth.max(1),
+                &SliceQueryOptions {
+                    max_neighbors,
+                    dedup,
+                    suppress_low_signal_repeats,
+                    low_signal_name_cap,
+                    prefer_project_symbols,
+                },
+            )?;
             if args.json {
                 print_json(&result)?;
             } else if let Some(slice) = result {
@@ -295,8 +445,12 @@ fn run_query(args: QueryArgs) -> Result<()> {
                 );
                 for edge in slice.neighbors {
                     println!(
-                        "{} {} -> {} [{}]",
-                        edge.direction, edge.edge_type, edge.entity.key, edge.entity.entity_type
+                        "{} {} -> {} [{}] score={:.2}",
+                        edge.direction,
+                        edge.edge_type,
+                        edge.entity.key,
+                        edge.entity.entity_type,
+                        edge.score.unwrap_or_default()
                     );
                 }
             } else {
@@ -306,18 +460,57 @@ fn run_query(args: QueryArgs) -> Result<()> {
         QueryCommands::Clones {
             file,
             min_similarity,
+            limit,
+            offset,
+            hotspots,
         } => {
-            let rows = store.clone_matches(&file, min_similarity)?;
+            let options = CloneQueryOptions {
+                min_similarity,
+                limit,
+                offset,
+            };
             if args.json {
-                print_json(&rows)?;
-            } else if rows.is_empty() {
-                println!("No clone candidates found for `{file}`");
+                if hotspots {
+                    let (rows, pagination, analysis) =
+                        store.clone_hotspots_page(&file, &options)?;
+                    print_json(&json!({
+                        "rows": rows,
+                        "pagination": pagination,
+                        "analysis": analysis,
+                        "mode": "hotspots"
+                    }))?;
+                } else {
+                    let (rows, pagination, analysis) = store.clone_matches_page(&file, &options)?;
+                    print_json(&json!({
+                        "rows": rows,
+                        "pagination": pagination,
+                        "analysis": analysis,
+                        "mode": "matches"
+                    }))?;
+                }
+            } else if hotspots {
+                let rows = store.clone_hotspots(&file, &options)?;
+                if rows.is_empty() {
+                    println!("No clone hotspots found for `{file}`");
+                } else {
+                    for row in rows {
+                        println!(
+                            "{} files={} avg_similarity={:.3} max_similarity={:.3}",
+                            row.directory, row.files, row.avg_similarity, row.max_similarity
+                        );
+                    }
+                }
             } else {
-                for row in rows {
-                    println!(
-                        "{} similarity={:.3} shared={}",
-                        row.other_file, row.similarity, row.shared_fingerprints
-                    );
+                let rows = store.clone_matches_with_options(&file, &options)?;
+                if rows.is_empty() {
+                    println!("No clone candidates found for `{file}`");
+                } else {
+                    for row in rows {
+                        println!(
+                            "{} similarity={:.3} shared={}",
+                            row.other_file, row.similarity, row.shared_fingerprints
+                        );
+                    }
                 }
             }
         }
@@ -327,8 +520,25 @@ fn run_query(args: QueryArgs) -> Result<()> {
 }
 
 fn run_mcp(args: McpArgs) -> Result<()> {
-    let paths = resolve_paths(&args.repo, args.state_dir.as_deref(), args.db.as_deref())?;
-    ensure_state_layout(&paths)?;
+    let repo = if args.repo_tail.is_empty() {
+        args.repo
+    } else {
+        format!("{} {}", args.repo, args.repo_tail.join(" "))
+    };
+    let repo_path = PathBuf::from(repo);
+    let paths = match resolve_paths(&repo_path, args.state_dir.as_deref(), args.db.as_deref()) {
+        Ok(paths) => paths,
+        Err(_) => resolve_paths(
+            Path::new("."),
+            args.state_dir.as_deref(),
+            args.db.as_deref(),
+        )?,
+    };
+
+    // Keep MCP handshake fast/robust: avoid early write requirements unless indexing on startup.
+    if args.auto_index {
+        ensure_state_layout(&paths)?;
+    }
     run_mcp_stdio(paths, args.auto_index, args.full_first)
 }
 
@@ -344,6 +554,8 @@ fn run_setup_codex(args: SetupCodexArgs) -> Result<()> {
         "mcp".to_string(),
         "--repo".to_string(),
         repo_display.clone(),
+        "--auto-index".to_string(),
+        "false".to_string(),
     ];
 
     if args.dry_run {
@@ -405,6 +617,17 @@ fn resolve_paths(
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn parse_sort_order(raw: &str) -> Result<SortOrder> {
+    match raw {
+        "asc" | "line_asc" => Ok(SortOrder::LineAsc),
+        "desc" | "line_desc" => Ok(SortOrder::LineDesc),
+        "score_desc" => Ok(SortOrder::ScoreDesc),
+        other => Err(anyhow::anyhow!(
+            "invalid --order `{other}`; expected one of: asc, desc, score_desc, line_asc, line_desc"
+        )),
+    }
 }
 
 fn run_codex_cli(codex_command: &str, args: &[String]) -> Result<std::process::ExitStatus> {
