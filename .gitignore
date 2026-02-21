@@ -1,0 +1,7 @@
+/target
+/.codex
+/.lumora
+/.lume
+*.db
+*.db-shm
+*.db-wal
