@@ -2084,3 +2084,688 @@ fn classify_special_file(path: &str) -> Option<&'static str> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::*;
+    use tempfile::TempDir;
+
+    fn test_store() -> (GraphStore, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = GraphStore::open(&db_path).unwrap();
+        (store, dir)
+    }
+
+    fn sample_extraction() -> FileExtraction {
+        FileExtraction {
+            language: LanguageKind::Rust,
+            definitions: vec![
+                Definition {
+                    name: "foo".into(),
+                    qualname: "foo".into(),
+                    kind: "function_item".into(),
+                    line: 1,
+                    col: 1,
+                    end_line: 3,
+                    end_col: 1,
+                },
+                Definition {
+                    name: "Bar".into(),
+                    qualname: "Bar".into(),
+                    kind: "struct_item".into(),
+                    line: 5,
+                    col: 1,
+                    end_line: 7,
+                    end_col: 1,
+                },
+            ],
+            references: vec![
+                Reference {
+                    name: "Bar".into(),
+                    kind: ReferenceKind::Ref,
+                    line: 2,
+                    col: 5,
+                    end_line: 2,
+                    end_col: 8,
+                },
+                Reference {
+                    name: "baz".into(),
+                    kind: ReferenceKind::Call,
+                    line: 2,
+                    col: 10,
+                    end_line: 2,
+                    end_col: 13,
+                },
+            ],
+            imports: vec![Import {
+                module: "std::collections::HashMap".into(),
+                line: 1,
+                col: 1,
+            }],
+        }
+    }
+
+    fn store_with_sample_data() -> (GraphStore, TempDir) {
+        let (mut store, dir) = test_store();
+        let extraction = sample_extraction();
+        let mut outcome = UpsertOutcome::new();
+        store
+            .index_file(
+                "src/main.rs",
+                "rust",
+                "abc123",
+                100,
+                &extraction,
+                &[],
+                &[],
+                &mut outcome,
+            )
+            .unwrap();
+        (store, dir)
+    }
+
+    // ── GraphStore basics ──────────────────────────────────────────
+
+    #[test]
+    fn test_open_creates_schema() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let _store1 = GraphStore::open(&db_path).expect("first open should succeed");
+        let _store2 = GraphStore::open(&db_path).expect("second open should succeed");
+    }
+
+    #[test]
+    fn test_index_file_and_tracked_hash() {
+        let (store, _dir) = store_with_sample_data();
+        let hash = store
+            .tracked_file_hash("src/main.rs")
+            .expect("tracked_file_hash should succeed");
+        assert_eq!(hash.as_deref(), Some("abc123"), "content hash should match");
+        let files = store.tracked_files().expect("tracked_files should succeed");
+        assert!(
+            files.contains("src/main.rs"),
+            "tracked_files should include src/main.rs"
+        );
+    }
+
+    #[test]
+    fn test_remove_files() {
+        let (mut store, _dir) = store_with_sample_data();
+        let mut outcome = UpsertOutcome::new();
+        store
+            .remove_files(&["src/main.rs".to_string()], &mut outcome)
+            .expect("remove_files should succeed");
+        assert_eq!(outcome.removed, 1, "one file should be removed");
+        let files = store.tracked_files().expect("tracked_files should succeed");
+        assert!(
+            files.is_empty(),
+            "tracked_files should be empty after removal"
+        );
+    }
+
+    // ── Symbol queries ─────────────────────────────────────────────
+
+    #[test]
+    fn test_symbol_definitions() {
+        let (store, _dir) = store_with_sample_data();
+        let defs = store
+            .symbol_definitions("foo")
+            .expect("symbol_definitions should succeed");
+        assert!(!defs.is_empty(), "should find definition for 'foo'");
+        assert_eq!(defs[0].file_path, "src/main.rs", "file_path should match");
+        assert_eq!(
+            defs[0].kind, "function_item",
+            "kind should be function_item"
+        );
+    }
+
+    #[test]
+    fn test_symbol_definitions_nonexistent() {
+        let (store, _dir) = store_with_sample_data();
+        let defs = store
+            .symbol_definitions("nonexistent")
+            .expect("symbol_definitions should succeed for missing symbol");
+        assert!(
+            defs.is_empty(),
+            "should return empty for nonexistent symbol"
+        );
+    }
+
+    #[test]
+    fn test_symbol_references_page() {
+        let (store, _dir) = store_with_sample_data();
+        let options = ReferenceQueryOptions::default();
+        let (rows, pagination) = store
+            .symbol_references_page("Bar", &options)
+            .expect("symbol_references_page should succeed");
+        assert!(!rows.is_empty(), "should find references for 'Bar'");
+        assert!(pagination.total > 0, "total should be positive");
+        assert_eq!(
+            rows[0].edge_type, "references",
+            "edge_type should be references"
+        );
+    }
+
+    #[test]
+    fn test_symbol_references_page_calls_filter() {
+        let (store, _dir) = store_with_sample_data();
+        let options = ReferenceQueryOptions {
+            edge_type_filter: Some("calls".into()),
+            ..Default::default()
+        };
+        let (rows, _pagination) = store
+            .symbol_references_page("baz", &options)
+            .expect("symbol_references_page with calls filter should succeed");
+        for row in &rows {
+            assert_eq!(row.edge_type, "calls", "all results should be calls");
+        }
+    }
+
+    #[test]
+    fn test_symbol_references_order_variants() {
+        let (store, _dir) = store_with_sample_data();
+        let orders = [
+            SortOrder::ScoreDesc,
+            SortOrder::LineAsc,
+            SortOrder::LineDesc,
+        ];
+        let mut counts = Vec::new();
+        for order in &orders {
+            let options = ReferenceQueryOptions {
+                order: *order,
+                ..Default::default()
+            };
+            let (rows, _) = store
+                .symbol_references_page("Bar", &options)
+                .expect("symbol_references_page should succeed for all orders");
+            counts.push(rows.len());
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "ScoreDesc and LineAsc should return same count"
+        );
+        assert_eq!(
+            counts[1], counts[2],
+            "LineAsc and LineDesc should return same count"
+        );
+    }
+
+    // ── Dependency path ────────────────────────────────────────────
+
+    #[test]
+    fn test_dependency_path_not_found() {
+        let (store, _dir) = store_with_sample_data();
+        let result = store
+            .dependency_path("file:nonexistent.rs", "file:also_nonexistent.rs", 5)
+            .expect("dependency_path should succeed even for missing entities");
+        assert!(
+            !result.found,
+            "should not find path between nonexistent files"
+        );
+    }
+
+    #[test]
+    fn test_dependency_path_same_entity() {
+        let (store, _dir) = store_with_sample_data();
+        let result = store
+            .dependency_path("file:src/main.rs", "file:src/main.rs", 5)
+            .expect("dependency_path for same entity should succeed");
+        assert!(result.found, "should find path to self");
+        assert_eq!(
+            result.hops.len(),
+            1,
+            "self-path should have exactly one hop"
+        );
+    }
+
+    // ── Minimal slice ──────────────────────────────────────────────
+
+    #[test]
+    fn test_minimal_slice_with_options() {
+        let (store, _dir) = store_with_sample_data();
+        let result = store
+            .minimal_slice_with_options("src/main.rs", None, 2, &SliceQueryOptions::default())
+            .expect("minimal_slice_with_options should succeed");
+        assert!(result.is_some(), "should return a slice for indexed file");
+    }
+
+    #[test]
+    fn test_minimal_slice_missing_file() {
+        let (store, _dir) = store_with_sample_data();
+        let result = store
+            .minimal_slice_with_options("nonexistent.rs", None, 2, &SliceQueryOptions::default())
+            .expect("minimal_slice for missing file should succeed");
+        assert!(result.is_none(), "should return None for nonexistent file");
+    }
+
+    // ── Clone detection ────────────────────────────────────────────
+
+    #[test]
+    fn test_clone_matches_no_fingerprints() {
+        let (store, _dir) = store_with_sample_data();
+        let options = CloneQueryOptions::default();
+        let (rows, _pagination, analysis) = store
+            .clone_matches_page("src/main.rs", &options)
+            .expect("clone_matches_page should succeed with no fingerprints");
+        assert!(rows.is_empty(), "no clone matches without fingerprints");
+        assert!(
+            analysis.empty_reason.is_some(),
+            "should have empty_reason when no fingerprints"
+        );
+    }
+
+    #[test]
+    fn test_clone_matches_with_fingerprints() {
+        let (mut store, _dir) = test_store();
+        let extraction = sample_extraction();
+        let mut outcome = UpsertOutcome::new();
+        store
+            .index_file(
+                "src/a.rs",
+                "rust",
+                "hash_a",
+                100,
+                &extraction,
+                &[(100, 0, 10), (200, 10, 20)],
+                &[],
+                &mut outcome,
+            )
+            .unwrap();
+        store
+            .index_file(
+                "src/b.rs",
+                "rust",
+                "hash_b",
+                100,
+                &extraction,
+                &[(100, 0, 10), (300, 10, 20)],
+                &[],
+                &mut outcome,
+            )
+            .unwrap();
+        let options = CloneQueryOptions {
+            min_similarity: 0.0,
+            ..Default::default()
+        };
+        let (rows, _pagination, _analysis) = store
+            .clone_matches_page("src/a.rs", &options)
+            .expect("clone_matches_page should succeed with shared fingerprints");
+        assert!(
+            !rows.is_empty(),
+            "should find clone matches with shared fingerprints"
+        );
+    }
+
+    #[test]
+    fn test_clone_hotspots() {
+        let (mut store, _dir) = test_store();
+        let extraction = sample_extraction();
+        let mut outcome = UpsertOutcome::new();
+        store
+            .index_file(
+                "src/a.rs",
+                "rust",
+                "hash_a",
+                100,
+                &extraction,
+                &[(100, 0, 10), (200, 10, 20)],
+                &[],
+                &mut outcome,
+            )
+            .unwrap();
+        store
+            .index_file(
+                "src/b.rs",
+                "rust",
+                "hash_b",
+                100,
+                &extraction,
+                &[(100, 0, 10), (300, 10, 20)],
+                &[],
+                &mut outcome,
+            )
+            .unwrap();
+        let options = CloneQueryOptions {
+            min_similarity: 0.0,
+            ..Default::default()
+        };
+        let hotspots = store
+            .clone_hotspots("src/a.rs", &options)
+            .expect("clone_hotspots should succeed");
+        assert!(!hotspots.is_empty(), "should find at least one hotspot");
+    }
+
+    // ── Selector suggestions ───────────────────────────────────────
+
+    #[test]
+    fn test_selector_suggestions_advanced() {
+        let (store, _dir) = store_with_sample_data();
+        let options = SelectorSuggestOptions {
+            query: Some("foo".into()),
+            fuzzy: true,
+            limit: 10,
+            ..Default::default()
+        };
+        let results = store
+            .selector_suggestions_advanced(&options)
+            .expect("selector_suggestions_advanced should succeed");
+        assert!(!results.is_empty(), "should find suggestions for 'foo'");
+    }
+
+    #[test]
+    fn test_selector_suggestions_no_query() {
+        let (store, _dir) = store_with_sample_data();
+        let options = SelectorSuggestOptions {
+            limit: 10,
+            ..Default::default()
+        };
+        let results = store
+            .selector_suggestions_advanced(&options)
+            .expect("selector_suggestions_advanced without query should succeed");
+        assert!(
+            !results.is_empty(),
+            "should return entities even without query"
+        );
+    }
+
+    // ── top_reference_files ────────────────────────────────────────
+
+    #[test]
+    fn test_top_reference_files() {
+        let (store, _dir) = test_store();
+        let refs = vec![
+            ReferenceLocation {
+                symbol_name: "x".into(),
+                file_path: "a.rs".into(),
+                line: 1,
+                col: 1,
+                edge_type: "references".into(),
+                score: None,
+                why: None,
+            },
+            ReferenceLocation {
+                symbol_name: "x".into(),
+                file_path: "a.rs".into(),
+                line: 2,
+                col: 1,
+                edge_type: "references".into(),
+                score: None,
+                why: None,
+            },
+            ReferenceLocation {
+                symbol_name: "x".into(),
+                file_path: "b.rs".into(),
+                line: 1,
+                col: 1,
+                edge_type: "calls".into(),
+                score: None,
+                why: None,
+            },
+        ];
+        let summary = store.top_reference_files(&refs, 10);
+        assert_eq!(summary.len(), 2, "should have 2 files");
+        assert_eq!(
+            summary[0].file_path, "a.rs",
+            "a.rs should be first (count=2)"
+        );
+        assert_eq!(summary[0].count, 2, "a.rs should have count=2");
+    }
+
+    // ── build_pagination ───────────────────────────────────────────
+
+    #[test]
+    fn test_build_pagination_basic() {
+        let p = build_pagination(10, 0, 5, 5);
+        assert_eq!(p.total, 10, "total should be 10");
+        assert!(p.has_more, "should have more pages");
+        assert_eq!(p.next_offset, Some(5), "next_offset should be 5");
+    }
+
+    #[test]
+    fn test_build_pagination_no_more() {
+        let p = build_pagination(5, 0, 10, 5);
+        assert!(!p.has_more, "should not have more pages");
+        assert_eq!(p.next_offset, None, "next_offset should be None");
+    }
+
+    #[test]
+    fn test_build_pagination_offset_past_end() {
+        let p = build_pagination(5, 100, 10, 0);
+        assert_eq!(p.offset, 5, "offset should be clamped to total");
+        assert!(!p.has_more, "should not have more pages");
+    }
+
+    // ── parse_selector ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_selector_file() {
+        let result = parse_selector("file:src/main.rs").expect("should parse file selector");
+        match result {
+            ParsedSelector::File(p) => assert_eq!(p, "src/main.rs", "path should match"),
+            other => panic!("expected File variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_selector_symbol_name() {
+        let result =
+            parse_selector("symbol_name:rust:foo").expect("should parse symbol_name selector");
+        match result {
+            ParsedSelector::SymbolName { lang, name } => {
+                assert_eq!(lang, "rust", "lang should be rust");
+                assert_eq!(name, "foo", "name should be foo");
+            }
+            other => panic!("expected SymbolName variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_selector_symbol() {
+        let result = parse_selector("symbol:main").expect("should parse symbol selector");
+        match result {
+            ParsedSelector::Name(n) => assert_eq!(n, "main", "name should be main"),
+            other => panic!("expected Name variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_selector_key() {
+        let result = parse_selector("key:some_key").expect("should parse key selector");
+        match result {
+            ParsedSelector::Key(k) => assert_eq!(k, "some_key", "key should match"),
+            other => panic!("expected Key variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_selector_auto() {
+        let result = parse_selector("main").expect("should parse auto selector");
+        match result {
+            ParsedSelector::Auto(v) => assert_eq!(v, "main", "auto value should match"),
+            other => panic!("expected Auto variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_selector_empty_errors() {
+        assert!(parse_selector("").is_err(), "empty selector should error");
+        assert!(
+            parse_selector("file:").is_err(),
+            "file: with no path should error"
+        );
+        assert!(
+            parse_selector("symbol_name:rust:").is_err(),
+            "symbol_name with empty name should error"
+        );
+        assert!(
+            parse_selector("symbol:").is_err(),
+            "symbol: with no name should error"
+        );
+    }
+
+    // ── Public key helpers ─────────────────────────────────────────
+
+    #[test]
+    fn test_file_key() {
+        assert_eq!(
+            file_key("src/main.rs"),
+            "file:src/main.rs",
+            "file_key format"
+        );
+    }
+
+    #[test]
+    fn test_symbol_name_key() {
+        assert_eq!(
+            symbol_name_key("rust", "foo"),
+            "symbol_name:rust:foo",
+            "symbol_name_key format"
+        );
+    }
+
+    #[test]
+    fn test_module_key() {
+        assert_eq!(
+            module_key("rust", "std::io"),
+            "module:rust:std::io",
+            "module_key format"
+        );
+    }
+
+    // ── classify_special_file ──────────────────────────────────────
+
+    #[test]
+    fn test_classify_special_file() {
+        assert_eq!(
+            classify_special_file("project/Cargo.toml"),
+            Some("config"),
+            "Cargo.toml should be config"
+        );
+        assert_eq!(
+            classify_special_file("project/src/main.rs"),
+            Some("entrypoint"),
+            "src/main.rs should be entrypoint"
+        );
+        assert_eq!(
+            classify_special_file("project/src/lib.rs"),
+            Some("entrypoint"),
+            "src/lib.rs should be entrypoint"
+        );
+        assert_eq!(
+            classify_special_file("project/__main__.py"),
+            Some("entrypoint"),
+            "__main__.py should be entrypoint"
+        );
+        assert_eq!(
+            classify_special_file("random.rs"),
+            None,
+            "random.rs should be None"
+        );
+    }
+
+    // ── Symbol name classification ────────────────────────────────
+
+    #[test]
+    fn test_is_low_signal_symbol_name() {
+        assert!(is_low_signal_symbol_name("Ok"), "Ok is low signal");
+        assert!(is_low_signal_symbol_name("Some"), "Some is low signal");
+        assert!(
+            !is_low_signal_symbol_name("GraphStore"),
+            "GraphStore is not low signal"
+        );
+    }
+
+    #[test]
+    fn test_is_project_local_symbol_name() {
+        assert!(
+            is_project_local_symbol_name("GraphStore"),
+            "GraphStore should be project local"
+        );
+        assert!(
+            !is_project_local_symbol_name("Ok"),
+            "Ok should not be project local (low signal)"
+        );
+        assert!(
+            !is_project_local_symbol_name("x"),
+            "single char should not be project local (too short)"
+        );
+        assert!(
+            !is_project_local_symbol_name("String"),
+            "String should not be project local (stdlib)"
+        );
+    }
+
+    // ── Fuzzy matching ─────────────────────────────────────────────
+
+    #[test]
+    fn test_fuzzy_subsequence_ratio() {
+        assert_eq!(
+            fuzzy_subsequence_ratio("abc", "abc"),
+            1.0,
+            "exact match should be 1.0"
+        );
+        assert!(
+            fuzzy_subsequence_ratio("xyz", "abc") < 1.0,
+            "non-matching should be < 1.0"
+        );
+        assert_eq!(
+            fuzzy_subsequence_ratio("", "abc"),
+            0.0,
+            "empty query should be 0.0"
+        );
+        assert_eq!(
+            fuzzy_subsequence_ratio("abc", ""),
+            0.0,
+            "empty text should be 0.0"
+        );
+    }
+
+    // ── Freshness and warnings ─────────────────────────────────────
+
+    #[test]
+    fn test_freshness_info_empty_db() {
+        let (store, _dir) = test_store();
+        let info = store
+            .freshness_info(24)
+            .expect("freshness_info should succeed");
+        assert!(info.is_stale, "empty db should be stale");
+        assert_eq!(info.file_count, 0, "empty db should have 0 files");
+    }
+
+    #[test]
+    fn test_freshness_info_after_indexing() {
+        let (store, _dir) = store_with_sample_data();
+        let info = store
+            .freshness_info(24)
+            .expect("freshness_info should succeed");
+        assert_eq!(info.file_count, 1, "should have 1 file after indexing");
+        assert!(!info.is_stale, "freshly indexed db should not be stale");
+    }
+
+    #[test]
+    fn test_index_warning_empty_db() {
+        let (store, _dir) = test_store();
+        let warning = store
+            .index_warning(24)
+            .expect("index_warning should succeed");
+        assert!(warning.is_some(), "empty db should produce a warning");
+        assert!(
+            warning.unwrap().contains("empty"),
+            "warning should mention empty index"
+        );
+    }
+
+    #[test]
+    fn test_index_warning_after_indexing() {
+        let (store, _dir) = store_with_sample_data();
+        let warning = store
+            .index_warning(24)
+            .expect("index_warning should succeed");
+        assert!(
+            warning.is_none(),
+            "freshly indexed db should not produce a warning"
+        );
+    }
+}

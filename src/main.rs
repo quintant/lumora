@@ -1,5 +1,7 @@
 mod daemon;
+mod fileops;
 mod indexer;
+mod languages;
 mod mcp;
 mod model;
 mod parser;
@@ -47,8 +49,8 @@ enum Commands {
 
 #[derive(Debug, Args)]
 struct IndexArgs {
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
+    #[arg(long)]
+    repo: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long)]
@@ -61,8 +63,8 @@ struct IndexArgs {
 
 #[derive(Debug, Args)]
 struct ServeArgs {
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
+    #[arg(long)]
+    repo: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long)]
@@ -77,8 +79,8 @@ struct ServeArgs {
 
 #[derive(Debug, Args)]
 struct QueryArgs {
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
+    #[arg(long)]
+    repo: Option<PathBuf>,
     #[arg(long)]
     state_dir: Option<PathBuf>,
     #[arg(long)]
@@ -91,8 +93,8 @@ struct QueryArgs {
 
 #[derive(Debug, Args)]
 struct McpArgs {
-    #[arg(long, default_value = ".")]
-    repo: String,
+    #[arg(long)]
+    repo: Option<String>,
     #[arg(hide = true)]
     repo_tail: Vec<String>,
     #[arg(long)]
@@ -107,8 +109,8 @@ struct McpArgs {
 
 #[derive(Debug, Args)]
 struct SetupCodexArgs {
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
+    #[arg(long)]
+    repo: Option<PathBuf>,
     #[arg(long, default_value = "lumora")]
     name: String,
     #[arg(long, default_value = "lumora")]
@@ -123,8 +125,8 @@ struct SetupCodexArgs {
 
 #[derive(Debug, Args)]
 struct PrintMcpConfigArgs {
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
+    #[arg(long)]
+    repo: Option<PathBuf>,
     #[arg(long, default_value = "lumora")]
     name: String,
     #[arg(long, default_value = "lumora")]
@@ -230,7 +232,11 @@ fn main() -> Result<()> {
 }
 
 fn run_index(args: IndexArgs) -> Result<()> {
-    let paths = resolve_paths(&args.repo, args.state_dir.as_deref(), args.db.as_deref())?;
+    let paths = resolve_paths(
+        args.repo.as_deref(),
+        args.state_dir.as_deref(),
+        args.db.as_deref(),
+    )?;
     ensure_state_layout(&paths)?;
 
     let mut store = GraphStore::open(&paths.db_path)?;
@@ -262,14 +268,22 @@ fn run_index(args: IndexArgs) -> Result<()> {
 }
 
 fn run_serve(args: ServeArgs) -> Result<()> {
-    let paths = resolve_paths(&args.repo, args.state_dir.as_deref(), args.db.as_deref())?;
+    let paths = resolve_paths(
+        args.repo.as_deref(),
+        args.state_dir.as_deref(),
+        args.db.as_deref(),
+    )?;
     ensure_state_layout(&paths)?;
 
     daemon::run_watcher_daemon(&paths, args.full_first, args.debounce_ms, args.json)
 }
 
 fn run_query(args: QueryArgs) -> Result<()> {
-    let paths = resolve_paths(&args.repo, args.state_dir.as_deref(), args.db.as_deref())?;
+    let paths = resolve_paths(
+        args.repo.as_deref(),
+        args.state_dir.as_deref(),
+        args.db.as_deref(),
+    )?;
     ensure_state_layout(&paths)?;
 
     let store = GraphStore::open(&paths.db_path)?;
@@ -520,20 +534,17 @@ fn run_query(args: QueryArgs) -> Result<()> {
 }
 
 fn run_mcp(args: McpArgs) -> Result<()> {
-    let repo = if args.repo_tail.is_empty() {
-        args.repo
-    } else {
-        format!("{} {}", args.repo, args.repo_tail.join(" "))
+    let repo_str = match (&args.repo, args.repo_tail.is_empty()) {
+        (Some(r), true) => Some(r.clone()),
+        (Some(r), false) => Some(format!("{} {}", r, args.repo_tail.join(" "))),
+        (None, _) => None,
     };
-    let repo_path = PathBuf::from(repo);
-    let paths = match resolve_paths(&repo_path, args.state_dir.as_deref(), args.db.as_deref()) {
-        Ok(paths) => paths,
-        Err(_) => resolve_paths(
-            Path::new("."),
-            args.state_dir.as_deref(),
-            args.db.as_deref(),
-        )?,
-    };
+    let repo_path = repo_str.map(PathBuf::from);
+    let paths = resolve_paths(
+        repo_path.as_deref(),
+        args.state_dir.as_deref(),
+        args.db.as_deref(),
+    )?;
 
     // Keep MCP handshake fast/robust: avoid early write requirements unless indexing on startup.
     if args.auto_index {
@@ -543,8 +554,6 @@ fn run_mcp(args: McpArgs) -> Result<()> {
 }
 
 fn run_setup_codex(args: SetupCodexArgs) -> Result<()> {
-    let paths = resolve_paths(&args.repo, None, None)?;
-    let repo_display = paths.repo_root.to_string_lossy().to_string();
     let add_args = vec![
         "mcp".to_string(),
         "add".to_string(),
@@ -552,8 +561,6 @@ fn run_setup_codex(args: SetupCodexArgs) -> Result<()> {
         "--".to_string(),
         args.command.clone(),
         "mcp".to_string(),
-        "--repo".to_string(),
-        repo_display.clone(),
         "--auto-index".to_string(),
         "false".to_string(),
     ];
@@ -583,21 +590,17 @@ fn run_setup_codex(args: SetupCodexArgs) -> Result<()> {
         ));
     }
 
-    println!(
-        "Registered MCP server `{}` for repo {}",
-        args.name, repo_display
-    );
+    println!("Registered MCP server `{}`", args.name);
     println!("Run `codex mcp get {}` to verify.", args.name);
     Ok(())
 }
 
 fn run_print_mcp_config(args: PrintMcpConfigArgs) -> Result<()> {
-    let paths = resolve_paths(&args.repo, None, None)?;
     let snippet = json!({
         "mcpServers": {
             args.name: {
                 "command": args.command,
-                "args": ["mcp", "--repo", paths.repo_root.to_string_lossy().to_string()],
+                "args": ["mcp"],
             }
         }
     });
@@ -607,11 +610,12 @@ fn run_print_mcp_config(args: PrintMcpConfigArgs) -> Result<()> {
 }
 
 fn resolve_paths(
-    repo: &std::path::Path,
+    repo: Option<&std::path::Path>,
     state_dir: Option<&std::path::Path>,
     db: Option<&std::path::Path>,
 ) -> Result<RuntimePaths> {
-    resolve_runtime_paths(repo, state_dir, db)
+    let repo_hint = repo.unwrap_or_else(|| Path::new("."));
+    resolve_runtime_paths(repo_hint, state_dir, db)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {

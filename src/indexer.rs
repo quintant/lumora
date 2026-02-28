@@ -12,8 +12,22 @@ use crate::parser::{detect_language, parse_file};
 use crate::paths::STATE_DIR_NAME;
 use crate::storage::{GraphStore, UpsertOutcome};
 
-const INDEXABLE_CONFIG_FILES: &[&str] =
-    &["Cargo.toml", "pyproject.toml", "setup.cfg", "package.json"];
+const INDEXABLE_CONFIG_FILES: &[&str] = &[
+    "Cargo.toml",
+    "pyproject.toml",
+    "setup.cfg",
+    "package.json",
+    "tsconfig.json",
+    "go.mod",
+    "build.gradle",
+    "build.gradle.kts",
+    "pom.xml",
+    "composer.json",
+    "Gemfile",
+    "renv.lock",
+    "requirements.txt",
+    "Pipfile",
+];
 const IGNORE_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -183,15 +197,6 @@ fn discover_files(repo_root: &Path) -> Result<Vec<CandidateFile>> {
             .with_context(|| format!("failed to strip repo prefix for {}", abs_path.display()))?;
         let rel_path = normalize_rel_path(rel);
 
-        if let Some(lang) = detect_language(&abs_path) {
-            files.push(CandidateFile {
-                abs_path,
-                rel_path,
-                kind: FileKind::Source(lang),
-            });
-            continue;
-        }
-
         let file_name = abs_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -203,6 +208,15 @@ fn discover_files(repo_root: &Path) -> Result<Vec<CandidateFile>> {
                 rel_path,
                 kind: FileKind::Config(config_language_hint(&file_name)),
             });
+            continue;
+        }
+
+        if let Some(lang) = detect_language(&abs_path) {
+            files.push(CandidateFile {
+                abs_path,
+                rel_path,
+                kind: FileKind::Source(lang),
+            });
         }
     }
 
@@ -213,7 +227,15 @@ fn discover_files(repo_root: &Path) -> Result<Vec<CandidateFile>> {
 fn config_language_hint(file_name: &str) -> LanguageKind {
     match file_name {
         "Cargo.toml" => LanguageKind::Rust,
-        _ => LanguageKind::Python,
+        "pyproject.toml" | "setup.cfg" | "requirements.txt" | "Pipfile" => LanguageKind::Python,
+        "package.json" => LanguageKind::JavaScript,
+        "tsconfig.json" => LanguageKind::TypeScript,
+        "go.mod" => LanguageKind::Go,
+        "build.gradle" | "build.gradle.kts" => LanguageKind::Kotlin,
+        "pom.xml" => LanguageKind::Java,
+        "Gemfile" => LanguageKind::Ruby,
+        "composer.json" => LanguageKind::Json,
+        _ => LanguageKind::Json,
     }
 }
 
@@ -259,6 +281,7 @@ fn resolve_single_import(
                 PathBuf::from(module_path).join("__init__.py"),
             ]
         }
+        _ => return None,
     };
 
     for candidate in candidates {
@@ -392,4 +415,284 @@ fn sha256_hex(content: &[u8]) -> String {
 
 fn normalize_rel_path(path: impl AsRef<Path>) -> String {
     path.as_ref().to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeSet;
+
+    use crate::model::Import;
+    use crate::storage::GraphStore;
+
+    fn setup_test_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().to_path_buf();
+        // Create .git dir so discover_repo_root works
+        std::fs::create_dir(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        (dir, repo)
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn open_test_store(repo: &Path) -> GraphStore {
+        GraphStore::open(&repo.join("graph.db")).unwrap()
+    }
+
+    #[test]
+    fn index_repository_basic_indexes_one_file() {
+        let (_dir, repo) = setup_test_repo();
+        write_file(&repo.join("src/lib.rs"), "pub fn greet() {}\n");
+
+        let mut store = open_test_store(&repo);
+        let report = index_repository(&mut store, &repo, IndexOptions { full: false }).unwrap();
+
+        assert_eq!(report.indexed_files, 1);
+        assert_eq!(report.skipped_files, 0);
+        assert_eq!(report.removed_files, 0);
+    }
+
+    #[test]
+    fn index_repository_incremental_skips_unchanged_file() {
+        let (_dir, repo) = setup_test_repo();
+        write_file(&repo.join("src/lib.rs"), "pub fn greet() {}\n");
+
+        let mut store = open_test_store(&repo);
+        let first = index_repository(&mut store, &repo, IndexOptions { full: false }).unwrap();
+        let second = index_repository(&mut store, &repo, IndexOptions { full: false }).unwrap();
+
+        assert_eq!(first.indexed_files, 1);
+        assert_eq!(second.indexed_files, 0);
+        assert_eq!(second.skipped_files, 1);
+        assert_eq!(second.removed_files, 0);
+    }
+
+    #[test]
+    fn index_repository_full_rebuild_reindexes_without_skips() {
+        let (_dir, repo) = setup_test_repo();
+        write_file(&repo.join("src/lib.rs"), "pub fn greet() {}\n");
+
+        let mut store = open_test_store(&repo);
+        let _ = index_repository(&mut store, &repo, IndexOptions { full: false }).unwrap();
+        let rebuild = index_repository(&mut store, &repo, IndexOptions { full: true }).unwrap();
+
+        assert_eq!(rebuild.indexed_files, 1);
+        assert_eq!(rebuild.skipped_files, 0);
+    }
+
+    #[test]
+    fn index_repository_removes_stale_files() {
+        let (_dir, repo) = setup_test_repo();
+        let file = repo.join("src/lib.rs");
+        write_file(&file, "pub fn greet() {}\n");
+
+        let mut store = open_test_store(&repo);
+        let _ = index_repository(&mut store, &repo, IndexOptions { full: false }).unwrap();
+
+        std::fs::remove_file(&file).unwrap();
+        let report = index_repository(&mut store, &repo, IndexOptions { full: false }).unwrap();
+
+        assert_eq!(report.removed_files, 1);
+    }
+
+    #[test]
+    fn file_discovery_respects_ignore_dirs() {
+        let (_dir, repo) = setup_test_repo();
+        write_file(&repo.join("target/foo.rs"), "pub fn ignored() {}\n");
+        write_file(&repo.join("node_modules/bar.py"), "print('ignored')\n");
+        write_file(&repo.join(".git/thing.rs"), "pub fn ignored() {}\n");
+
+        let files = discover_files(&repo).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn file_discovery_finds_config_files() {
+        let (_dir, repo) = setup_test_repo();
+        write_file(
+            &repo.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        );
+        write_file(&repo.join("pyproject.toml"), "[project]\nname = \"x\"\n");
+        write_file(&repo.join("package.json"), "{\"name\":\"x\"}\n");
+
+        let files = discover_files(&repo).unwrap();
+        let rel_paths: BTreeSet<String> = files.iter().map(|item| item.rel_path.clone()).collect();
+        assert_eq!(
+            rel_paths,
+            BTreeSet::from([
+                "Cargo.toml".to_string(),
+                "package.json".to_string(),
+                "pyproject.toml".to_string(),
+            ])
+        );
+
+        let cargo = files
+            .iter()
+            .find(|item| item.rel_path == "Cargo.toml")
+            .unwrap();
+        let pyproject = files
+            .iter()
+            .find(|item| item.rel_path == "pyproject.toml")
+            .unwrap();
+        let package_json = files
+            .iter()
+            .find(|item| item.rel_path == "package.json")
+            .unwrap();
+
+        assert!(matches!(cargo.kind, FileKind::Config(LanguageKind::Rust)));
+        assert!(matches!(
+            pyproject.kind,
+            FileKind::Config(LanguageKind::Python)
+        ));
+        assert!(matches!(
+            package_json.kind,
+            FileKind::Config(LanguageKind::JavaScript)
+        ));
+    }
+
+    #[test]
+    fn file_discovery_finds_rs_and_py_sources() {
+        let (_dir, repo) = setup_test_repo();
+        write_file(&repo.join("src/lib.rs"), "pub fn r() {}\n");
+        write_file(&repo.join("src/mod.py"), "def p():\n    return 1\n");
+
+        let files = discover_files(&repo).unwrap();
+        let rel_paths: BTreeSet<String> = files.iter().map(|item| item.rel_path.clone()).collect();
+
+        assert_eq!(
+            rel_paths,
+            BTreeSet::from(["src/lib.rs".to_string(), "src/mod.py".to_string()])
+        );
+    }
+
+    #[test]
+    fn build_winnowed_fingerprints_produces_non_empty_tuples() {
+        let content = "fn main() { let alpha = 1; let beta = alpha + 2; println!(\"{}\", beta); }";
+        let fps = build_winnowed_fingerprints(content, 5, 4);
+        let token_count = tokenize(content).len() as i64;
+
+        assert!(!fps.is_empty());
+        for (hash, start, end) in fps {
+            assert_ne!(hash, 0);
+            assert!(start >= 0);
+            assert!(end > start);
+            assert!(end <= token_count);
+        }
+    }
+
+    #[test]
+    fn build_winnowed_fingerprints_empty_content_returns_empty_vec() {
+        let fps = build_winnowed_fingerprints("", 5, 4);
+        assert!(fps.is_empty());
+    }
+
+    #[test]
+    fn build_winnowed_fingerprints_short_content_returns_empty_vec() {
+        let fps = build_winnowed_fingerprints("short tokens", 5, 4);
+        assert!(fps.is_empty());
+    }
+
+    #[test]
+    fn import_resolution_for_rust_resolves_to_src_storage_rs() {
+        let (_dir, repo) = setup_test_repo();
+        write_file(
+            &repo.join("src/main.rs"),
+            "use crate::storage::GraphStore;\nfn main() {}\n",
+        );
+        write_file(&repo.join("src/storage.rs"), "pub struct GraphStore;\n");
+
+        let imports = vec![Import {
+            module: "crate::storage::GraphStore".to_string(),
+            line: 1,
+            col: 1,
+        }];
+        let resolved = resolve_imports(&repo, "src/main.rs", LanguageKind::Rust, &imports);
+
+        assert_eq!(
+            resolve_single_import(
+                &repo,
+                "src/main.rs",
+                LanguageKind::Rust,
+                "crate::storage::GraphStore"
+            ),
+            Some("src/storage.rs".to_string())
+        );
+        assert!(resolved.contains(&(
+            "crate::storage::GraphStore".to_string(),
+            "src/storage.rs".to_string()
+        )));
+    }
+
+    #[test]
+    fn import_resolution_for_python_resolves_module_file() {
+        let (_dir, repo) = setup_test_repo();
+        write_file(&repo.join("main.py"), "import foo\nfoo.run()\n");
+        write_file(&repo.join("foo.py"), "def run():\n    return 1\n");
+
+        let imports = vec![Import {
+            module: "foo".to_string(),
+            line: 1,
+            col: 1,
+        }];
+        let resolved = resolve_imports(&repo, "main.py", LanguageKind::Python, &imports);
+
+        assert_eq!(
+            resolve_single_import(&repo, "main.py", LanguageKind::Python, "foo"),
+            Some("foo.py".to_string())
+        );
+        assert!(resolved.contains(&("foo".to_string(), "foo.py".to_string())));
+    }
+
+    #[test]
+    fn parse_failures_stay_zero_for_valid_rust_content() {
+        let (_dir, repo) = setup_test_repo();
+        write_file(
+            &repo.join("src/main.rs"),
+            "fn main() { println!(\"ok\"); }\n",
+        );
+
+        let mut store = open_test_store(&repo);
+        let report = index_repository(&mut store, &repo, IndexOptions { full: false }).unwrap();
+
+        assert_eq!(report.parse_failures, 0);
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn private_helpers_cover_hashes_paths_and_candidates() {
+        assert_eq!(config_language_hint("Cargo.toml"), LanguageKind::Rust);
+        assert_eq!(
+            config_language_hint("package.json"),
+            LanguageKind::JavaScript
+        );
+
+        assert_eq!(
+            normalize_rel_path(std::path::Path::new("src/lib.rs")),
+            "src/lib.rs"
+        );
+
+        assert_eq!(tokenize("Hello_World! 123"), vec!["hello_world", "123"]);
+
+        let first_hash = stable_i64_hash(b"alpha");
+        let same_hash = stable_i64_hash(b"alpha");
+        let different_hash = stable_i64_hash(b"beta");
+        assert_eq!(first_hash, same_hash);
+        assert_ne!(first_hash, different_hash);
+
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let rust_candidates = rust_import_candidates("crate::storage::GraphStore as Store");
+        assert!(rust_candidates.contains(&PathBuf::from("src/storage.rs")));
+    }
 }

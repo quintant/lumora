@@ -4,6 +4,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
+use crate::fileops;
 use crate::indexer::{index_repository, IndexOptions};
 use crate::paths::RuntimePaths;
 use crate::storage::{
@@ -380,6 +381,127 @@ fn call_tool(
             )?;
             Ok(compact_if_needed(response, verbosity))
         }
+        "lumora.read_file" => {
+            let path = required_str(args, "path")?;
+            let start_line = opt_u64(args, "start_line")?;
+            let end_line = opt_u64(args, "end_line")?;
+            let max_lines = opt_u64(args, "max_lines")?.unwrap_or(500);
+            fileops::read_file_contents(&paths.repo_root, path, start_line, end_line, max_lines)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.file_outline" => {
+            let path = required_str(args, "path")?;
+            let max_depth = opt_u64(args, "max_depth")?.map(|v| v as usize);
+            fileops::file_outline(&paths.repo_root, path, max_depth)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.search_files" => {
+            let pattern = required_str(args, "pattern")?;
+            let file_glob = opt_string(args, "file_glob")?;
+            let context_lines = opt_u64(args, "context_lines")?.unwrap_or(2);
+            let max_results = opt_u64(args, "max_results")?.unwrap_or(50);
+            let is_regex = opt_bool(args, "is_regex")?.unwrap_or(false);
+            fileops::search_in_files(
+                &paths.repo_root,
+                pattern,
+                file_glob.as_deref(),
+                context_lines,
+                max_results,
+                is_regex,
+            )
+            .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.list_directory" => {
+            let path = opt_string(args, "path")?.unwrap_or_else(|| ".".to_string());
+            let recursive = opt_bool(args, "recursive")?.unwrap_or(false);
+            let max_depth = opt_u64(args, "max_depth")?.unwrap_or(3);
+            let file_glob = opt_string(args, "file_glob")?;
+            fileops::list_dir(
+                &paths.repo_root,
+                &path,
+                recursive,
+                max_depth,
+                file_glob.as_deref(),
+            )
+            .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.write_file" => {
+            let path = required_str(args, "path")?;
+            let content = required_str(args, "content")?;
+            let create_dirs = opt_bool(args, "create_dirs")?.unwrap_or(true);
+            fileops::write_file_contents(&paths.repo_root, path, content, create_dirs)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.edit_file" => {
+            let path = required_str(args, "path")?;
+            let old_text = required_str(args, "old_text")?;
+            let new_text = required_str(args, "new_text")?;
+            let dry_run = opt_bool(args, "dry_run")?.unwrap_or(false);
+            fileops::edit_file_contents(&paths.repo_root, path, old_text, new_text, dry_run)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.multi_read" => {
+            let reads_arg = args
+                .get("reads")
+                .ok_or_else(|| ToolCallError::InvalidParams("missing field `reads`".to_string()))?;
+            let reads_array = reads_arg.as_array().ok_or_else(|| {
+                ToolCallError::InvalidParams("`reads` must be an array".to_string())
+            })?;
+
+            let mut reads = Vec::with_capacity(reads_array.len());
+            for (idx, item) in reads_array.iter().enumerate() {
+                let obj = item.as_object().ok_or_else(|| {
+                    ToolCallError::InvalidParams(format!("`reads[{idx}]` must be an object"))
+                })?;
+                let path = obj
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`reads[{idx}].path` must be a string"
+                        ))
+                    })?
+                    .to_string();
+
+                let start_line = match obj.get("start_line") {
+                    Some(value) => Some(value.as_u64().ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`reads[{idx}].start_line` must be an integer"
+                        ))
+                    })?),
+                    None => None,
+                };
+                let end_line = match obj.get("end_line") {
+                    Some(value) => Some(value.as_u64().ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`reads[{idx}].end_line` must be an integer"
+                        ))
+                    })?),
+                    None => None,
+                };
+
+                reads.push(fileops::MultiReadRequest {
+                    path,
+                    start_line,
+                    end_line,
+                });
+            }
+
+            let max_total_lines = opt_u64(args, "max_total_lines")?.unwrap_or(2000);
+            fileops::multi_read(&paths.repo_root, &reads, max_total_lines)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.move_file" => {
+            let source = required_str(args, "source")?;
+            let destination = required_str(args, "destination")?;
+            fileops::move_file_op(&paths.repo_root, source, destination)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.delete_file" => {
+            let path = required_str(args, "path")?;
+            fileops::delete_file_op(&paths.repo_root, path)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
         "lumora.selector_discover" => {
             let query = opt_string(args, "query")?;
             let limit = opt_u64(args, "limit")?.unwrap_or(50).max(1) as usize;
@@ -576,6 +698,133 @@ fn tool_descriptors() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "lumora.read_file",
+            "description": "Read file contents with optional line range for efficient partial reads.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "start_line": { "type": "integer" },
+                    "end_line": { "type": "integer" },
+                    "max_lines": { "type": "integer", "default": 500 }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.file_outline",
+            "description": "Get AST-derived structure outline of a file (definitions only, no content). Fast symbol lookup.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "max_depth": { "type": "integer" }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.search_files",
+            "description": "Search file contents with regex or literal patterns. Returns matches with context.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["pattern"],
+                "properties": {
+                    "pattern": { "type": "string" },
+                    "file_glob": { "type": "string" },
+                    "context_lines": { "type": "integer", "default": 2 },
+                    "max_results": { "type": "integer", "default": 50 },
+                    "is_regex": { "type": "boolean", "default": false }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.list_directory",
+            "description": "List directory contents with metadata.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "default": "." },
+                    "recursive": { "type": "boolean", "default": false },
+                    "max_depth": { "type": "integer", "default": 3 },
+                    "file_glob": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.write_file",
+            "description": "Create or overwrite a file.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "content"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "create_dirs": { "type": "boolean", "default": true }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.edit_file",
+            "description": "Search-and-replace edit. old_text must match exactly once in the file.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "old_text", "new_text"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "old_text": { "type": "string" },
+                    "new_text": { "type": "string" },
+                    "dry_run": { "type": "boolean", "default": false }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.multi_read",
+            "description": "Batch read multiple files in one call to reduce round trips.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["reads"],
+                "properties": {
+                    "reads": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["path"],
+                            "properties": {
+                                "path": { "type": "string" },
+                                "start_line": { "type": "integer" },
+                                "end_line": { "type": "integer" }
+                            }
+                        }
+                    },
+                    "max_total_lines": { "type": "integer", "default": 2000 }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.move_file",
+            "description": "Move or rename a file within the repository.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["source", "destination"],
+                "properties": {
+                    "source": { "type": "string" },
+                    "destination": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.delete_file",
+            "description": "Delete a file from the repository.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            }
+        }),
     ]
 }
 
@@ -710,7 +959,7 @@ fn write_frame(writer: &mut impl Write, payload: &Value, style: FrameStyle) -> R
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Verbosity {
     Compact,
     Normal,
@@ -873,7 +1122,492 @@ fn opt_verbosity(args: &Value, key: &str) -> std::result::Result<Option<Verbosit
     }
 }
 
+#[derive(Debug)]
 enum ToolCallError {
     InvalidParams(String),
     Runtime(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::Cursor;
+    use tempfile::TempDir;
+
+    fn test_paths() -> (RuntimePaths, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let repo_root = dir.path().to_path_buf();
+        let state_dir = dir.path().join(".lumora");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let db_path = state_dir.join("graph.db");
+        let paths = RuntimePaths {
+            repo_root,
+            state_dir,
+            db_path,
+        };
+        (paths, dir)
+    }
+
+    // ── Parameter helpers ───────────────────────────────────────────
+
+    #[test]
+    fn test_required_str_present() {
+        let args = json!({"name": "foo"});
+        let result = required_str(&args, "name");
+        assert!(result.is_ok(), "should succeed for present string");
+        assert_eq!(result.unwrap(), "foo", "should return the string value");
+    }
+
+    #[test]
+    fn test_required_str_missing() {
+        let args = json!({});
+        assert!(
+            required_str(&args, "name").is_err(),
+            "should fail for missing key"
+        );
+    }
+
+    #[test]
+    fn test_required_str_wrong_type() {
+        let args = json!({"name": 42});
+        assert!(
+            required_str(&args, "name").is_err(),
+            "should fail for non-string value"
+        );
+    }
+
+    #[test]
+    fn test_opt_bool_present() {
+        let args = json!({"x": true});
+        let result = opt_bool(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        assert_eq!(result.unwrap(), Some(true), "should return Some(true)");
+    }
+
+    #[test]
+    fn test_opt_bool_missing() {
+        let args = json!({});
+        let result = opt_bool(&args, "x");
+        assert!(result.is_ok(), "should succeed for missing key");
+        assert_eq!(result.unwrap(), None, "should return None");
+    }
+
+    #[test]
+    fn test_opt_bool_wrong_type() {
+        let args = json!({"x": "yes"});
+        assert!(opt_bool(&args, "x").is_err(), "should fail for non-bool");
+    }
+
+    #[test]
+    fn test_opt_u64_present() {
+        let args = json!({"x": 42});
+        let result = opt_u64(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        assert_eq!(result.unwrap(), Some(42), "should return Some(42)");
+    }
+
+    #[test]
+    fn test_opt_u64_missing() {
+        let args = json!({});
+        let result = opt_u64(&args, "x");
+        assert!(result.is_ok(), "should succeed for missing key");
+        assert_eq!(result.unwrap(), None, "should return None");
+    }
+
+    #[test]
+    fn test_opt_i64_present() {
+        let args = json!({"x": -5});
+        let result = opt_i64(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        assert_eq!(result.unwrap(), Some(-5), "should return Some(-5)");
+    }
+
+    #[test]
+    fn test_opt_i64_null() {
+        let args = json!({"x": null});
+        let result = opt_i64(&args, "x");
+        assert!(result.is_ok(), "null should succeed");
+        assert_eq!(result.unwrap(), None, "null should return None");
+    }
+
+    #[test]
+    fn test_opt_f64_present() {
+        let args = json!({"x": 1.5});
+        let result = opt_f64(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        let val = result.unwrap().expect("should be Some");
+        assert!((val - 1.5).abs() < f64::EPSILON, "should be ~1.5");
+    }
+
+    #[test]
+    fn test_opt_string_present() {
+        let args = json!({"x": "hello"});
+        let result = opt_string(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        assert_eq!(
+            result.unwrap(),
+            Some("hello".to_string()),
+            "should return Some(hello)"
+        );
+    }
+
+    #[test]
+    fn test_opt_string_null() {
+        let args = json!({"x": null});
+        let result = opt_string(&args, "x");
+        assert!(result.is_ok(), "null should succeed");
+        assert_eq!(result.unwrap(), None, "null should return None");
+    }
+
+    #[test]
+    fn test_opt_string_missing() {
+        let args = json!({});
+        let result = opt_string(&args, "x");
+        assert!(result.is_ok(), "missing should succeed");
+        assert_eq!(result.unwrap(), None, "missing should return None");
+    }
+
+    #[test]
+    fn test_opt_order_score_desc() {
+        let args = json!({"x": "score_desc"});
+        let result = opt_order(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        assert_eq!(
+            result.unwrap(),
+            Some(SortOrder::ScoreDesc),
+            "should return ScoreDesc"
+        );
+    }
+
+    #[test]
+    fn test_opt_order_asc_alias() {
+        let args = json!({"x": "asc"});
+        let result = opt_order(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        assert_eq!(
+            result.unwrap(),
+            Some(SortOrder::LineAsc),
+            "asc should map to LineAsc"
+        );
+    }
+
+    #[test]
+    fn test_opt_order_invalid() {
+        let args = json!({"x": "invalid_order"});
+        assert!(opt_order(&args, "x").is_err(), "invalid order should error");
+    }
+
+    #[test]
+    fn test_opt_verbosity_compact() {
+        let args = json!({"x": "compact"});
+        let result = opt_verbosity(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        assert_eq!(
+            result.unwrap(),
+            Some(Verbosity::Compact),
+            "should return Compact"
+        );
+    }
+
+    #[test]
+    fn test_opt_verbosity_normal() {
+        let args = json!({"x": "normal"});
+        let result = opt_verbosity(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        assert_eq!(
+            result.unwrap(),
+            Some(Verbosity::Normal),
+            "should return Normal"
+        );
+    }
+
+    #[test]
+    fn test_opt_verbosity_debug() {
+        let args = json!({"x": "debug"});
+        let result = opt_verbosity(&args, "x");
+        assert!(result.is_ok(), "should succeed");
+        assert_eq!(
+            result.unwrap(),
+            Some(Verbosity::Debug),
+            "should return Debug"
+        );
+    }
+
+    #[test]
+    fn test_opt_verbosity_invalid() {
+        let args = json!({"x": "xxx"});
+        assert!(
+            opt_verbosity(&args, "x").is_err(),
+            "invalid verbosity should error"
+        );
+    }
+
+    // ── Frame reading/writing ───────────────────────────────────────
+
+    #[test]
+    fn test_read_frame_line_delimited() {
+        let data = b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n";
+        let mut cursor = Cursor::new(&data[..]);
+        let frame = read_frame(&mut cursor)
+            .expect("read_frame should succeed")
+            .expect("should return Some frame");
+        assert_eq!(frame.value["method"], "ping", "method should be ping");
+        match frame.style {
+            FrameStyle::LineDelimited => {} // expected
+            FrameStyle::ContentLength => panic!("expected LineDelimited, got ContentLength"),
+        }
+    }
+
+    #[test]
+    fn test_read_frame_content_length() {
+        let json_payload = b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}";
+        let header = format!("Content-Length: {}\r\n\r\n", json_payload.len());
+        let mut data = Vec::new();
+        data.extend_from_slice(header.as_bytes());
+        data.extend_from_slice(json_payload);
+        let mut cursor = Cursor::new(data);
+        let frame = read_frame(&mut cursor)
+            .expect("read_frame should succeed")
+            .expect("should return Some frame");
+        assert_eq!(frame.value["method"], "ping", "method should be ping");
+        match frame.style {
+            FrameStyle::ContentLength => {} // expected
+            FrameStyle::LineDelimited => panic!("expected ContentLength, got LineDelimited"),
+        }
+    }
+
+    #[test]
+    fn test_read_frame_eof() {
+        let mut cursor = Cursor::new(b"" as &[u8]);
+        let result = read_frame(&mut cursor).expect("read_frame should succeed on eof");
+        assert!(result.is_none(), "eof should return None");
+    }
+
+    #[test]
+    fn test_read_frame_skips_blank_lines() {
+        let data = b"\n\n{\"method\":\"ping\"}\n";
+        let mut cursor = Cursor::new(&data[..]);
+        let frame = read_frame(&mut cursor)
+            .expect("read_frame should succeed")
+            .expect("should skip blank lines and return frame");
+        assert_eq!(
+            frame.value["method"], "ping",
+            "should parse the JSON after blanks"
+        );
+    }
+
+    #[test]
+    fn test_write_frame_line_delimited() {
+        let mut buf = Vec::new();
+        let payload = json!({"test": true});
+        write_frame(&mut buf, &payload, FrameStyle::LineDelimited)
+            .expect("write_frame should succeed");
+        let output = String::from_utf8(buf).expect("should be valid utf8");
+        assert!(
+            output.ends_with('\n'),
+            "line-delimited should end with newline"
+        );
+        assert!(
+            output.contains("\"test\""),
+            "output should contain the JSON"
+        );
+    }
+
+    #[test]
+    fn test_write_frame_content_length() {
+        let mut buf = Vec::new();
+        let payload = json!({"test": true});
+        write_frame(&mut buf, &payload, FrameStyle::ContentLength)
+            .expect("write_frame should succeed");
+        let output = String::from_utf8(buf).expect("should be valid utf8");
+        assert!(
+            output.starts_with("Content-Length:"),
+            "content-length should start with header"
+        );
+    }
+
+    // ── Response builders ──────────────────────────────────────────
+
+    #[test]
+    fn test_success_response() {
+        let resp = success_response(json!(1), json!({"ok": true}));
+        assert_eq!(resp["jsonrpc"], "2.0", "jsonrpc should be 2.0");
+        assert_eq!(resp["id"], 1, "id should be 1");
+        assert_eq!(resp["result"]["ok"], true, "result.ok should be true");
+    }
+
+    #[test]
+    fn test_error_response() {
+        let resp = error_response(Some(json!(2)), -32601, "not found");
+        assert_eq!(resp["error"]["code"], -32601, "error code should match");
+        assert_eq!(
+            resp["error"]["message"], "not found",
+            "error message should match"
+        );
+    }
+
+    #[test]
+    fn test_tool_ok() {
+        let result = tool_ok(json!({"data": 1}));
+        let content = &result["content"];
+        assert!(content.is_array(), "content should be array");
+        assert_eq!(
+            content[0]["type"], "text",
+            "first content item type should be text"
+        );
+        assert!(
+            result["structuredContent"].is_object(),
+            "structuredContent should be present"
+        );
+    }
+
+    #[test]
+    fn test_tool_error() {
+        let result = tool_error("boom".to_string());
+        assert_eq!(
+            result["content"][0]["text"], "boom",
+            "error text should be boom"
+        );
+        assert_eq!(result["isError"], true, "isError should be true");
+    }
+
+    // ── handle_request integration tests ───────────────────────────
+
+    #[test]
+    fn test_handle_initialize() {
+        let (paths, _dir) = test_paths();
+        let params = json!({"protocolVersion": "2025-06-18"});
+        let resp = handle_request("initialize", Some(&params), json!(1), &paths)
+            .expect("handle_request initialize should succeed");
+        assert!(
+            resp["result"]["protocolVersion"].is_string(),
+            "should have protocolVersion"
+        );
+        assert!(
+            resp["result"]["capabilities"]["tools"].is_object(),
+            "should have tools capability"
+        );
+    }
+
+    #[test]
+    fn test_handle_ping() {
+        let (paths, _dir) = test_paths();
+        let resp = handle_request("ping", None, json!(2), &paths)
+            .expect("handle_request ping should succeed");
+        assert!(resp["result"].is_object(), "ping result should be object");
+    }
+
+    #[test]
+    fn test_handle_tools_list() {
+        let (paths, _dir) = test_paths();
+        let resp = handle_request("tools/list", None, json!(3), &paths)
+            .expect("handle_request tools/list should succeed");
+        let tools = &resp["result"]["tools"];
+        assert!(tools.is_array(), "tools should be an array");
+        assert_eq!(tools.as_array().unwrap().len(), 17, "should list 17 tools");
+    }
+
+    #[test]
+    fn test_handle_unknown_method() {
+        let (paths, _dir) = test_paths();
+        let resp = handle_request("foo/bar", None, json!(4), &paths)
+            .expect("handle_request unknown method should succeed");
+        assert_eq!(
+            resp["error"]["code"], -32601,
+            "unknown method should return -32601"
+        );
+    }
+
+    #[test]
+    fn test_handle_tools_call_missing_params() {
+        let (paths, _dir) = test_paths();
+        let resp = handle_request("tools/call", None, json!(5), &paths)
+            .expect("handle_request should succeed");
+        assert!(
+            resp["error"].is_object(),
+            "missing params should produce error"
+        );
+    }
+
+    #[test]
+    fn test_handle_tools_call_missing_name() {
+        let (paths, _dir) = test_paths();
+        let params = json!({"arguments": {}});
+        let resp = handle_request("tools/call", Some(&params), json!(6), &paths)
+            .expect("handle_request should succeed");
+        assert!(
+            resp["error"].is_object(),
+            "missing name should produce error"
+        );
+    }
+
+    #[test]
+    fn test_handle_symbol_definitions_tool() {
+        let (paths, _dir) = test_paths();
+        // First index the repository to create the DB
+        let _index_resp = handle_request(
+            "tools/call",
+            Some(&json!({"name": "lumora.index_repository", "arguments": {}})),
+            json!(10),
+            &paths,
+        )
+        .expect("index should succeed");
+        // Then query for a nonexistent symbol
+        let resp = handle_request(
+            "tools/call",
+            Some(
+                &json!({"name": "lumora.symbol_definitions", "arguments": {"name": "nonexistent"}}),
+            ),
+            json!(11),
+            &paths,
+        )
+        .expect("symbol_definitions should succeed");
+        assert!(
+            resp["result"]["structuredContent"].is_object(),
+            "should have structuredContent"
+        );
+    }
+
+    // ── compact_if_needed and strip_compact_fields ─────────────────
+
+    #[test]
+    fn test_compact_if_needed_compact() {
+        let value = json!({
+            "rows": [{"why": "reason", "meta_json": "data", "name": "x"}],
+            "diagnostics": {"detail": true}
+        });
+        let compacted = compact_if_needed(value, Verbosity::Compact);
+        assert!(
+            compacted.get("diagnostics").is_none(),
+            "diagnostics should be removed in compact mode"
+        );
+        let row = &compacted["rows"][0];
+        assert!(
+            row.get("why").is_none(),
+            "why should be stripped in compact mode"
+        );
+        assert!(
+            row.get("meta_json").is_none(),
+            "meta_json should be stripped in compact mode"
+        );
+        assert_eq!(row["name"], "x", "non-compact fields should be preserved");
+    }
+
+    #[test]
+    fn test_compact_if_needed_normal() {
+        let value = json!({
+            "rows": [{"why": "reason", "meta_json": "data", "name": "x"}],
+            "diagnostics": {"detail": true}
+        });
+        let result = compact_if_needed(value, Verbosity::Normal);
+        assert!(
+            result.get("diagnostics").is_some(),
+            "diagnostics should be preserved in normal mode"
+        );
+        assert!(
+            result["rows"][0].get("why").is_some(),
+            "why should be preserved in normal mode"
+        );
+    }
 }
