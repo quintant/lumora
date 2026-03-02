@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.3.0] - 2026-03-02
+
+### Added
+- 9 new file-operation MCP tools: `read_file`, `file_outline`, `search_files`, `list_directory`, `write_file`, `edit_file`, `multi_read`, `move_file`, `delete_file` — all sandboxed to the repository root.
+- Support for 21 additional languages via tree-sitter grammars: JavaScript, TypeScript, TSX, Go, Java, C, C++, C#, Ruby, Bash, CSS, HTML, JSON, TOML, YAML, Scala, Kotlin, Lua, Elixir, Haskell, Swift.
+- New `src/fileops.rs` module implementing all file-operation tool logic with path-traversal protection.
+- New `src/storage.rs` module with a cleaner query/storage abstraction layer.
+- New `src/paths.rs` module for repository-root detection and path sandboxing utilities.
+- New `src/languages.rs` module centralising language detection and grammar dispatch.
+- `regex` dependency for text search in `search_files`.
+- Comprehensive unit tests across `mcp.rs` and the new modules.
+
+### Changed
+- MCP server now exposes 17 tools (up from 8).
+- README updated to document all 17 tools and 23 supported languages.
+
+
 ## [0.2.0] - 2026-02-21
 
 ### Added
