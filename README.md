@@ -161,16 +161,17 @@ Generate a config snippet: `lumora print-mcp-config`
 
 ## What It Does
 
-### 17 MCP Tools in One Server
+### 21 MCP Tools in One Server
 
 Lumora replaces a patchwork of file-reading and search tools with a single, purpose-built MCP server. Every tool is designed to minimize token usage and maximize signal.
 
-#### Semantic Code Graph (8 tools)
+#### Semantic Code Graph (9 tools)
 
 | Tool | What it does |
 |------|-------------|
 | `lumora.index_repository` | Incremental or full re-index of the codebase |
 | `lumora.symbol_definitions` | Jump to where a symbol is defined |
+| `lumora.symbol_source` | Read the code for symbol definitions with bounded context |
 | `lumora.symbol_references` | Find every reference to a symbol, ranked and deduped |
 | `lumora.symbol_callers` | Find all call sites of a function |
 | `lumora.dependency_path` | Trace how module A depends on module B |
@@ -178,7 +179,7 @@ Lumora replaces a patchwork of file-reading and search tools with a single, purp
 | `lumora.clone_matches` | Detect duplicate or similar code blocks |
 | `lumora.selector_discover` | Fuzzy-find symbols and files by partial name |
 
-#### File Operations (9 tools)
+#### File Operations (12 tools)
 
 All file operations are **sandboxed to the repository root** — no path traversal allowed.
 
@@ -186,10 +187,13 @@ All file operations are **sandboxed to the repository root** — no path travers
 |------|-------------|
 | `lumora.read_file` | Read with optional line range; default cap of 500 lines |
 | `lumora.file_outline` | AST-derived structure (definitions only, zero source content) |
+| `lumora.multi_outline` | Batch multiple AST outlines into one round trip |
 | `lumora.search_files` | Regex or literal search with context lines and glob filtering |
 | `lumora.list_directory` | Directory listing with metadata, recursive option, glob filtering |
 | `lumora.write_file` | Create or overwrite files, with optional parent directory creation |
 | `lumora.edit_file` | Exact search-and-replace (must match once); supports dry run |
+| `lumora.batch_edit` | Apply multiple validated edits across files in one atomic call |
+| `lumora.apply_patch` | Apply exact line-based hunks atomically across existing files |
 | `lumora.multi_read` | Batch-read multiple files in one call with a shared line budget |
 | `lumora.move_file` | Move or rename a file within the repo |
 | `lumora.delete_file` | Delete a file |
@@ -200,7 +204,13 @@ All file operations are **sandboxed to the repository root** — no path travers
 
 **vs. `grep`/`ripgrep`**: Lumora's `search_files` is fine for text search, but `symbol_references` and `symbol_callers` understand *semantic* relationships — not just string matches. "Where is `Config` referenced?" finds actual usage, not comments and strings.
 
-**vs. reading whole files for structure**: `file_outline` returns AST-parsed definitions (functions, classes, structs) with line numbers — no source code. An agent can scan a 2,000-line file's structure in a few dozen tokens.
+**vs. reading whole files for structure**: `file_outline` returns AST-parsed definitions (functions, classes, structs) with line numbers — no source code. `multi_outline` lets an agent scan several files' structure in one round trip.
+
+**vs. stitching tools together by hand**: `symbol_source` removes the common “definitions -> file path -> line range -> read” dance by jumping straight from symbol name to bounded source spans.
+
+**vs. brittle one-off replacements**: `edit_file` is ideal when one exact match should change. `batch_edit` handles coordinated edits across files or sequential edits in one file, and validates the whole batch before writing anything.
+
+**vs. fragile text matching for larger edits**: `apply_patch` uses exact line-based hunks, so an agent can patch known spans with insertions, deletions, and replacements while still getting atomic validation across files.
 
 **vs. multiple MCP servers**: One server, one connection, one index. No juggling a file-system MCP, a search MCP, and a code-intelligence MCP separately.
 
@@ -252,7 +262,7 @@ Returns similarity scores, shared fingerprint counts, and hotspot directories �
 
 2. **Query**: The semantic graph supports symbol lookup, reference tracing, caller discovery, dependency paths, and code clone detection — all with ranking, dedup, and pagination.
 
-3. **Serve**: The MCP server exposes all 17 tools over stdin/stdout JSON-RPC. Agents call tools, get precise results, and stay within their token budget.
+3. **Serve**: The MCP server exposes all 21 tools over stdin/stdout JSON-RPC. Agents call tools, get precise results, and stay within their token budget.
 
 Indexing is incremental — only changed files are re-processed. A full re-index is available with `--full`.
 

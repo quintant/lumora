@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog and this project follows Semantic Versioning.
 
+## [0.4.0] - 2026-03-06
+
+### Added
+- New `multi_outline` MCP tool for batching AST-derived structure outlines across multiple files in one call.
+- New `batch_edit` MCP tool for applying multiple validated text edits across one or more files atomically.
+- New `symbol_source` MCP tool for reading symbol definition source spans directly with shared line budgets.
+- New `apply_patch` MCP tool for exact line-based hunk application across existing files with atomic validation.
+
+### Changed
+- `file_outline` now returns the file path even for unsupported languages, which makes batched structural inspection easier to consume consistently.
+- `symbol_definitions` responses now include stored symbol end positions when available.
+
+### Fixed
+- Removed an unused internal `Edge` model that was generating a warning on every build/test run.
+
 ## [0.3.0] - 2026-03-02
 
 ### Added

@@ -119,6 +119,69 @@ fn call_tool(
                 .map_err(|err| ToolCallError::Runtime(err.to_string()))?;
             Ok(json!({ "rows": rows }))
         }
+        "lumora.symbol_source" => {
+            let symbol = required_str(args, "name")?;
+            let context_lines = opt_u64(args, "context_lines")?.unwrap_or(2);
+            let max_definitions = opt_u64(args, "max_definitions")?.unwrap_or(10).max(1) as usize;
+            let max_total_lines = opt_u64(args, "max_total_lines")?.unwrap_or(400).max(1);
+            let store = open_store(paths)?;
+            let defs = store
+                .symbol_definitions(symbol)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))?;
+
+            let selected = defs.into_iter().take(max_definitions).collect::<Vec<_>>();
+            let reads = selected
+                .iter()
+                .map(|definition| fileops::MultiReadRequest {
+                    path: definition.file_path.clone(),
+                    start_line: Some(
+                        definition.line.max(1).saturating_sub(context_lines as i64) as u64
+                    ),
+                    end_line: Some(
+                        definition
+                            .end_line
+                            .unwrap_or(definition.line)
+                            .max(definition.line)
+                            .saturating_add(context_lines as i64) as u64,
+                    ),
+                })
+                .collect::<Vec<_>>();
+
+            let read_results = fileops::multi_read(&paths.repo_root, &reads, max_total_lines)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))?;
+            let result_rows = read_results
+                .get("results")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            let rows = selected
+                .into_iter()
+                .zip(result_rows.into_iter())
+                .map(|(definition, read)| {
+                    json!({
+                        "symbol_name": definition.symbol_name,
+                        "qualname": definition.qualname,
+                        "kind": definition.kind,
+                        "file_path": definition.file_path,
+                        "line": definition.line,
+                        "end_line": definition.end_line,
+                        "read": read
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            Ok(json!({
+                "rows": rows,
+                "total_lines_returned": read_results["total_lines_returned"],
+                "query": {
+                    "name": symbol,
+                    "context_lines": context_lines,
+                    "max_definitions": max_definitions,
+                    "max_total_lines": max_total_lines
+                }
+            }))
+        }
         "lumora.symbol_references" => {
             let symbol = required_str(args, "name")?;
             let verbosity = opt_verbosity(args, "verbosity")?.unwrap_or(Verbosity::Normal);
@@ -395,6 +458,43 @@ fn call_tool(
             fileops::file_outline(&paths.repo_root, path, max_depth)
                 .map_err(|err| ToolCallError::Runtime(err.to_string()))
         }
+        "lumora.multi_outline" => {
+            let outlines_arg = args.get("outlines").ok_or_else(|| {
+                ToolCallError::InvalidParams("missing field `outlines`".to_string())
+            })?;
+            let outlines_array = outlines_arg.as_array().ok_or_else(|| {
+                ToolCallError::InvalidParams("`outlines` must be an array".to_string())
+            })?;
+
+            let mut outlines = Vec::with_capacity(outlines_array.len());
+            for (idx, item) in outlines_array.iter().enumerate() {
+                let obj = item.as_object().ok_or_else(|| {
+                    ToolCallError::InvalidParams(format!("`outlines[{idx}]` must be an object"))
+                })?;
+                let path = obj
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`outlines[{idx}].path` must be a string"
+                        ))
+                    })?
+                    .to_string();
+                let max_depth = match obj.get("max_depth") {
+                    Some(value) => Some(value.as_u64().ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`outlines[{idx}].max_depth` must be an integer"
+                        ))
+                    })? as usize),
+                    None => None,
+                };
+
+                outlines.push(fileops::MultiOutlineRequest { path, max_depth });
+            }
+
+            fileops::multi_outline(&paths.repo_root, &outlines)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
         "lumora.search_files" => {
             let pattern = required_str(args, "pattern")?;
             let file_glob = opt_string(args, "file_glob")?;
@@ -438,6 +538,140 @@ fn call_tool(
             let new_text = required_str(args, "new_text")?;
             let dry_run = opt_bool(args, "dry_run")?.unwrap_or(false);
             fileops::edit_file_contents(&paths.repo_root, path, old_text, new_text, dry_run)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.batch_edit" => {
+            let edits_arg = args
+                .get("edits")
+                .ok_or_else(|| ToolCallError::InvalidParams("missing field `edits`".to_string()))?;
+            let edits_array = edits_arg.as_array().ok_or_else(|| {
+                ToolCallError::InvalidParams("`edits` must be an array".to_string())
+            })?;
+
+            let mut edits = Vec::with_capacity(edits_array.len());
+            for (idx, item) in edits_array.iter().enumerate() {
+                let obj = item.as_object().ok_or_else(|| {
+                    ToolCallError::InvalidParams(format!("`edits[{idx}]` must be an object"))
+                })?;
+                let path = obj
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`edits[{idx}].path` must be a string"
+                        ))
+                    })?
+                    .to_string();
+                let old_text = obj
+                    .get("old_text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`edits[{idx}].old_text` must be a string"
+                        ))
+                    })?
+                    .to_string();
+                let new_text = obj
+                    .get("new_text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`edits[{idx}].new_text` must be a string"
+                        ))
+                    })?
+                    .to_string();
+                let replace_all = match obj.get("replace_all") {
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`edits[{idx}].replace_all` must be a boolean"
+                        ))
+                    })?,
+                    None => false,
+                };
+
+                edits.push(fileops::BatchEditRequest {
+                    path,
+                    old_text,
+                    new_text,
+                    replace_all,
+                });
+            }
+
+            let dry_run = opt_bool(args, "dry_run")?.unwrap_or(false);
+            fileops::batch_edit_file_contents(&paths.repo_root, &edits, dry_run)
+                .map_err(|err| ToolCallError::Runtime(err.to_string()))
+        }
+        "lumora.apply_patch" => {
+            let patches_arg = args.get("patches").ok_or_else(|| {
+                ToolCallError::InvalidParams("missing field `patches`".to_string())
+            })?;
+            let patches_array = patches_arg.as_array().ok_or_else(|| {
+                ToolCallError::InvalidParams("`patches` must be an array".to_string())
+            })?;
+
+            let mut patches = Vec::with_capacity(patches_array.len());
+            for (patch_idx, patch_item) in patches_array.iter().enumerate() {
+                let patch_obj = patch_item.as_object().ok_or_else(|| {
+                    ToolCallError::InvalidParams(format!(
+                        "`patches[{patch_idx}]` must be an object"
+                    ))
+                })?;
+                let path = patch_obj
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`patches[{patch_idx}].path` must be a string"
+                        ))
+                    })?
+                    .to_string();
+                let hunks_value = patch_obj.get("hunks").ok_or_else(|| {
+                    ToolCallError::InvalidParams(format!(
+                        "`patches[{patch_idx}].hunks` is required"
+                    ))
+                })?;
+                let hunks_array = hunks_value.as_array().ok_or_else(|| {
+                    ToolCallError::InvalidParams(format!(
+                        "`patches[{patch_idx}].hunks` must be an array"
+                    ))
+                })?;
+
+                let mut hunks = Vec::with_capacity(hunks_array.len());
+                for (hunk_idx, hunk_item) in hunks_array.iter().enumerate() {
+                    let hunk_obj = hunk_item.as_object().ok_or_else(|| {
+                        ToolCallError::InvalidParams(format!(
+                            "`patches[{patch_idx}].hunks[{hunk_idx}]` must be an object"
+                        ))
+                    })?;
+                    let start_line = hunk_obj
+                        .get("start_line")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| {
+                            ToolCallError::InvalidParams(format!(
+                                "`patches[{patch_idx}].hunks[{hunk_idx}].start_line` must be an integer"
+                            ))
+                        })?;
+                    let old_lines = json_string_array(
+                        hunk_obj.get("old_lines"),
+                        &format!("`patches[{patch_idx}].hunks[{hunk_idx}].old_lines`"),
+                    )?;
+                    let new_lines = json_string_array(
+                        hunk_obj.get("new_lines"),
+                        &format!("`patches[{patch_idx}].hunks[{hunk_idx}].new_lines`"),
+                    )?;
+
+                    hunks.push(fileops::PatchHunkRequest {
+                        start_line,
+                        old_lines,
+                        new_lines,
+                    });
+                }
+
+                patches.push(fileops::FilePatchRequest { path, hunks });
+            }
+
+            let dry_run = opt_bool(args, "dry_run")?.unwrap_or(false);
+            fileops::apply_patch_file_contents(&paths.repo_root, &patches, dry_run)
                 .map_err(|err| ToolCallError::Runtime(err.to_string()))
         }
         "lumora.multi_read" => {
@@ -589,6 +823,20 @@ fn tool_descriptors() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "lumora.symbol_source",
+            "description": "Read the source spans for symbol definitions with optional surrounding context and a shared line budget.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "context_lines": { "type": "integer", "minimum": 0 },
+                    "max_definitions": { "type": "integer", "minimum": 1 },
+                    "max_total_lines": { "type": "integer", "minimum": 1 }
+                }
+            }
+        }),
+        json!({
             "name": "lumora.symbol_references",
             "description": "Find references for a symbol name with ranking, paging, filtering, and summary controls.",
             "inputSchema": {
@@ -725,6 +973,27 @@ fn tool_descriptors() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "lumora.multi_outline",
+            "description": "Batch AST-derived structure outlines for multiple files in one call.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["outlines"],
+                "properties": {
+                    "outlines": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["path"],
+                            "properties": {
+                                "path": { "type": "string" },
+                                "max_depth": { "type": "integer", "minimum": 0 }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
             "name": "lumora.search_files",
             "description": "Search file contents with regex or literal patterns. Returns matches with context.",
             "inputSchema": {
@@ -775,6 +1044,69 @@ fn tool_descriptors() -> Vec<Value> {
                     "path": { "type": "string" },
                     "old_text": { "type": "string" },
                     "new_text": { "type": "string" },
+                    "dry_run": { "type": "boolean", "default": false }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.batch_edit",
+            "description": "Apply multiple validated text edits across one or more files in a single atomic call.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["edits"],
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["path", "old_text", "new_text"],
+                            "properties": {
+                                "path": { "type": "string" },
+                                "old_text": { "type": "string" },
+                                "new_text": { "type": "string" },
+                                "replace_all": { "type": "boolean", "default": false }
+                            }
+                        }
+                    },
+                    "dry_run": { "type": "boolean", "default": false }
+                }
+            }
+        }),
+        json!({
+            "name": "lumora.apply_patch",
+            "description": "Apply exact line-based patch hunks across existing files in a single atomic call.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["patches"],
+                "properties": {
+                    "patches": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["path", "hunks"],
+                            "properties": {
+                                "path": { "type": "string" },
+                                "hunks": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["start_line", "old_lines", "new_lines"],
+                                        "properties": {
+                                            "start_line": { "type": "integer", "minimum": 1 },
+                                            "old_lines": {
+                                                "type": "array",
+                                                "items": { "type": "string" }
+                                            },
+                                            "new_lines": {
+                                                "type": "array",
+                                                "items": { "type": "string" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
                     "dry_run": { "type": "boolean", "default": false }
                 }
             }
@@ -1090,6 +1422,27 @@ fn opt_string(args: &Value, key: &str) -> std::result::Result<Option<String>, To
             .ok_or_else(|| ToolCallError::InvalidParams(format!("`{key}` must be string"))),
         None => Ok(None),
     }
+}
+
+fn json_string_array(
+    value: Option<&Value>,
+    label: &str,
+) -> std::result::Result<Vec<String>, ToolCallError> {
+    let array =
+        value.ok_or_else(|| ToolCallError::InvalidParams(format!("{label} is required")))?;
+    let values = array
+        .as_array()
+        .ok_or_else(|| ToolCallError::InvalidParams(format!("{label} must be an array")))?;
+
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            item.as_str().map(str::to_string).ok_or_else(|| {
+                ToolCallError::InvalidParams(format!("{label}[{idx}] must be a string"))
+            })
+        })
+        .collect()
 }
 
 fn opt_order(args: &Value, key: &str) -> std::result::Result<Option<SortOrder>, ToolCallError> {
@@ -1505,7 +1858,7 @@ mod tests {
             .expect("handle_request tools/list should succeed");
         let tools = &resp["result"]["tools"];
         assert!(tools.is_array(), "tools should be an array");
-        assert_eq!(tools.as_array().unwrap().len(), 17, "should list 17 tools");
+        assert_eq!(tools.as_array().unwrap().len(), 21, "should list 21 tools");
     }
 
     #[test]
@@ -1566,6 +1919,150 @@ mod tests {
         assert!(
             resp["result"]["structuredContent"].is_object(),
             "should have structuredContent"
+        );
+    }
+
+    #[test]
+    fn test_handle_symbol_source_tool() {
+        let (paths, _dir) = test_paths();
+        std::fs::create_dir_all(paths.repo_root.join("src")).expect("src dir should exist");
+        std::fs::write(
+            paths.repo_root.join("src/lib.rs"),
+            "fn demo() {\n    println!(\"hi\");\n}\n",
+        )
+        .expect("rust file should be written");
+
+        let _index_resp = handle_request(
+            "tools/call",
+            Some(&json!({"name": "lumora.index_repository", "arguments": {}})),
+            json!(12),
+            &paths,
+        )
+        .expect("index should succeed");
+
+        let resp = handle_request(
+            "tools/call",
+            Some(&json!({
+                "name": "lumora.symbol_source",
+                "arguments": {"name": "demo", "context_lines": 0, "max_total_lines": 20}
+            })),
+            json!(13),
+            &paths,
+        )
+        .expect("symbol_source should succeed");
+
+        let content = &resp["result"]["structuredContent"];
+        let rows = content["rows"].as_array().expect("rows should be array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["symbol_name"], "demo");
+        assert_eq!(rows[0]["read"]["path"], "src/lib.rs");
+        assert!(
+            rows[0]["read"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("println!"),
+            "source read should include function body"
+        );
+    }
+
+    #[test]
+    fn test_handle_multi_outline_tool() {
+        let (paths, _dir) = test_paths();
+        std::fs::create_dir_all(paths.repo_root.join("src")).expect("src dir should exist");
+        std::fs::write(
+            paths.repo_root.join("src/lib.rs"),
+            "fn alpha() {}\nstruct Beta;\n",
+        )
+        .expect("rust file should be written");
+        std::fs::write(paths.repo_root.join("src/file.txt"), "hello\n")
+            .expect("text file should be written");
+
+        let resp = handle_request(
+            "tools/call",
+            Some(&json!({
+                "name": "lumora.multi_outline",
+                "arguments": {
+                    "outlines": [
+                        {"path": "src/lib.rs"},
+                        {"path": "src/file.txt"}
+                    ]
+                }
+            })),
+            json!(12),
+            &paths,
+        )
+        .expect("multi_outline should succeed");
+
+        let content = &resp["result"]["structuredContent"];
+        assert_eq!(content["results"].as_array().unwrap().len(), 2);
+        assert_eq!(content["unsupported_files"], 1);
+    }
+
+    #[test]
+    fn test_handle_batch_edit_tool() {
+        let (paths, _dir) = test_paths();
+        std::fs::create_dir_all(paths.repo_root.join("src")).expect("src dir should exist");
+        std::fs::write(paths.repo_root.join("src/a.rs"), "let a = 1;\n")
+            .expect("first file should be written");
+        std::fs::write(paths.repo_root.join("src/b.rs"), "let b = 2;\n")
+            .expect("second file should be written");
+
+        let resp = handle_request(
+            "tools/call",
+            Some(&json!({
+                "name": "lumora.batch_edit",
+                "arguments": {
+                    "edits": [
+                        {"path": "src/a.rs", "old_text": "1", "new_text": "10"},
+                        {"path": "src/b.rs", "old_text": "2", "new_text": "20"}
+                    ]
+                }
+            })),
+            json!(14),
+            &paths,
+        )
+        .expect("batch_edit should succeed");
+
+        let content = &resp["result"]["structuredContent"];
+        assert_eq!(content["changed_files"], 2);
+        assert_eq!(content["total_replacements_applied"], 2);
+    }
+
+    #[test]
+    fn test_handle_apply_patch_tool() {
+        let (paths, _dir) = test_paths();
+        std::fs::create_dir_all(paths.repo_root.join("src")).expect("src dir should exist");
+        std::fs::write(paths.repo_root.join("src/edit.rs"), "one\ntwo\nthree\n")
+            .expect("file should be written");
+
+        let resp = handle_request(
+            "tools/call",
+            Some(&json!({
+                "name": "lumora.apply_patch",
+                "arguments": {
+                    "patches": [
+                        {
+                            "path": "src/edit.rs",
+                            "hunks": [
+                                {"start_line": 1, "old_lines": [], "new_lines": ["zero"]},
+                                {"start_line": 2, "old_lines": ["two"], "new_lines": ["TWO"]}
+                            ]
+                        }
+                    ]
+                }
+            })),
+            json!(15),
+            &paths,
+        )
+        .expect("apply_patch should succeed");
+
+        let content = &resp["result"]["structuredContent"];
+        assert_eq!(content["changed_files"], 1);
+        assert_eq!(content["total_hunks_applied"], 2);
+        assert_eq!(
+            std::fs::read_to_string(paths.repo_root.join("src/edit.rs"))
+                .expect("file should be readable"),
+            "zero\none\nTWO\nthree\n"
         );
     }
 

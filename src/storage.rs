@@ -561,7 +561,7 @@ impl GraphStore {
     pub fn symbol_definitions(&self, symbol_name: &str) -> Result<Vec<SymbolLocation>> {
         let mut stmt = self.conn.prepare(
             "
-            SELECT s.name, s.file_path, s.line, s.col,
+            SELECT s.name, s.file_path, s.line, s.col, s.end_line, s.end_col,
                    json_extract(s.meta_json, '$.kind') as kind,
                    json_extract(s.meta_json, '$.qualname') as qualname
             FROM entities sn
@@ -578,11 +578,13 @@ impl GraphStore {
                 file_path: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 line: row.get::<_, Option<i64>>(2)?.unwrap_or_default(),
                 col: row.get::<_, Option<i64>>(3)?.unwrap_or_default(),
+                end_line: row.get(4)?,
+                end_col: row.get(5)?,
                 kind: row
-                    .get::<_, Option<String>>(4)?
+                    .get::<_, Option<String>>(6)?
                     .unwrap_or_else(|| "unknown".to_string()),
                 qualname: row
-                    .get::<_, Option<String>>(5)?
+                    .get::<_, Option<String>>(7)?
                     .unwrap_or_else(|| symbol_name.to_string()),
             })
         })?;
@@ -2219,6 +2221,7 @@ mod tests {
             defs[0].kind, "function_item",
             "kind should be function_item"
         );
+        assert_eq!(defs[0].end_line, Some(3), "end_line should be preserved");
     }
 
     #[test]

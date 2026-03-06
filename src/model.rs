@@ -124,23 +124,15 @@ pub struct Entity {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Edge {
-    pub id: i64,
-    pub src_entity_id: i64,
-    pub dst_entity_id: i64,
-    pub edge_type: String,
-    pub file_path: Option<String>,
-    pub line: Option<i64>,
-    pub col: Option<i64>,
-    pub meta_json: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct SymbolLocation {
     pub symbol_name: String,
     pub file_path: String,
     pub line: i64,
     pub col: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_col: Option<i64>,
     pub kind: String,
     pub qualname: String,
 }

@@ -30,6 +30,33 @@ pub struct MultiReadRequest {
     pub end_line: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MultiOutlineRequest {
+    pub path: String,
+    pub max_depth: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchEditRequest {
+    pub path: String,
+    pub old_text: String,
+    pub new_text: String,
+    pub replace_all: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PatchHunkRequest {
+    pub start_line: u64,
+    pub old_lines: Vec<String>,
+    pub new_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilePatchRequest {
+    pub path: String,
+    pub hunks: Vec<PatchHunkRequest>,
+}
+
 pub fn safe_resolve_path(base: &Path, user_path: &str) -> Result<PathBuf> {
     let base_canonical = fs::canonicalize(base)
         .with_context(|| format!("failed to canonicalize base path {}", base.display()))?;
@@ -91,9 +118,12 @@ pub fn file_outline(repo_root: &Path, path: &str, max_depth: Option<usize>) -> R
     let resolved = safe_resolve_path(repo_root, path)?;
     let source = fs::read_to_string(&resolved)
         .with_context(|| format!("failed to read {}", resolved.display()))?;
+    let rel_path = to_rel_path(repo_root, &resolved)?;
 
     let Some(parsed) = parse_file(&resolved, &source)? else {
         return Ok(json!({
+            "path": rel_path,
+            "language": Value::Null,
             "entries": [],
             "note": "unsupported language for AST outline"
         }));
@@ -121,9 +151,36 @@ pub fn file_outline(repo_root: &Path, path: &str, max_depth: Option<usize>) -> R
         .collect();
 
     Ok(json!({
-        "path": to_rel_path(repo_root, &resolved)?,
+        "path": rel_path,
         "language": parsed.language.as_str(),
         "entries": entries
+    }))
+}
+
+pub fn multi_outline(repo_root: &Path, outlines: &[MultiOutlineRequest]) -> Result<Value> {
+    let mut results = Vec::with_capacity(outlines.len());
+    let mut total_entries = 0_u64;
+    let mut unsupported_files = 0_u64;
+
+    for request in outlines {
+        let outline = file_outline(repo_root, &request.path, request.max_depth)?;
+        total_entries += outline
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(|entries| entries.len() as u64)
+            .unwrap_or(0);
+        if outline.get("note").and_then(Value::as_str)
+            == Some("unsupported language for AST outline")
+        {
+            unsupported_files += 1;
+        }
+        results.push(outline);
+    }
+
+    Ok(json!({
+        "results": results,
+        "total_entries": total_entries,
+        "unsupported_files": unsupported_files
     }))
 }
 
@@ -375,37 +432,181 @@ pub fn edit_file_contents(
     new_text: &str,
     dry_run: bool,
 ) -> Result<Value> {
-    if old_text.is_empty() {
-        return Err(anyhow!("old_text must not be empty"));
-    }
-
     let resolved = safe_resolve_path(repo_root, path)?;
     let original = fs::read_to_string(&resolved)
         .with_context(|| format!("failed to read {}", resolved.display()))?;
-
-    let occurrences = original.matches(old_text).count();
-    if occurrences == 0 {
-        return Err(anyhow!("old_text not found in file"));
-    }
-    if occurrences > 1 {
-        return Err(anyhow!(
-            "old_text matches {} times; must match exactly once",
-            occurrences
-        ));
-    }
-
-    let updated = original.replacen(old_text, new_text, 1);
+    let applied_edit = apply_text_edit(&original, old_text, new_text, false)?;
+    let updated = applied_edit.updated;
     if !dry_run {
         fs::write(&resolved, updated.as_bytes())
             .with_context(|| format!("failed to write {}", resolved.display()))?;
     }
 
-    let preview = build_diff_preview(&original, &updated, old_text);
     Ok(json!({
         "path": to_rel_path(repo_root, &resolved)?,
         "applied": !dry_run,
-        "occurrences_found": occurrences,
-        "diff_preview": preview
+        "occurrences_found": applied_edit.occurrences_found,
+        "replacements_applied": applied_edit.replacements_applied,
+        "diff_preview": applied_edit.diff_preview
+    }))
+}
+
+pub fn batch_edit_file_contents(
+    repo_root: &Path,
+    edits: &[BatchEditRequest],
+    dry_run: bool,
+) -> Result<Value> {
+    let mut pending_files = Vec::<PendingFileEdit>::new();
+    let mut results = Vec::with_capacity(edits.len());
+    let mut total_replacements_applied = 0_u64;
+
+    for edit in edits {
+        let resolved = safe_resolve_path(repo_root, &edit.path)?;
+        let rel_path = to_rel_path(repo_root, &resolved)?;
+
+        let pending_idx = if let Some(idx) = pending_files
+            .iter()
+            .position(|item| item.resolved == resolved)
+        {
+            idx
+        } else {
+            let original = fs::read_to_string(&resolved)
+                .with_context(|| format!("failed to read {}", resolved.display()))?;
+            pending_files.push(PendingFileEdit {
+                resolved: resolved.clone(),
+                original: original.clone(),
+                current: original,
+            });
+            pending_files.len() - 1
+        };
+
+        let pending = &mut pending_files[pending_idx];
+        let applied_edit = apply_text_edit(
+            &pending.current,
+            &edit.old_text,
+            &edit.new_text,
+            edit.replace_all,
+        )?;
+        pending.current = applied_edit.updated;
+        total_replacements_applied += applied_edit.replacements_applied;
+
+        results.push(json!({
+            "path": rel_path,
+            "replace_all": edit.replace_all,
+            "occurrences_found": applied_edit.occurrences_found,
+            "replacements_applied": applied_edit.replacements_applied,
+            "diff_preview": applied_edit.diff_preview
+        }));
+    }
+
+    let changed_files = pending_files
+        .iter()
+        .filter(|item| item.current != item.original)
+        .count() as u64;
+
+    if !dry_run {
+        for item in &pending_files {
+            if item.current != item.original {
+                fs::write(&item.resolved, item.current.as_bytes())
+                    .with_context(|| format!("failed to write {}", item.resolved.display()))?;
+            }
+        }
+    }
+
+    Ok(json!({
+        "results": results,
+        "applied": !dry_run,
+        "changed_files": changed_files,
+        "total_replacements_applied": total_replacements_applied
+    }))
+}
+
+pub fn apply_patch_file_contents(
+    repo_root: &Path,
+    patches: &[FilePatchRequest],
+    dry_run: bool,
+) -> Result<Value> {
+    let mut pending_files = Vec::<PendingPatchedFile>::new();
+    let mut results = Vec::with_capacity(patches.len());
+    let mut total_hunks_applied = 0_u64;
+
+    for patch in patches {
+        let resolved = safe_resolve_path(repo_root, &patch.path)?;
+        let rel_path = to_rel_path(repo_root, &resolved)?;
+        let pending_idx = if let Some(idx) = pending_files
+            .iter()
+            .position(|item| item.resolved == resolved)
+        {
+            idx
+        } else {
+            let original_source = fs::read_to_string(&resolved)
+                .with_context(|| format!("failed to read {}", resolved.display()))?;
+            pending_files.push(PendingPatchedFile {
+                resolved: resolved.clone(),
+                original: LineBuffer::from_source(&original_source),
+                current: LineBuffer::from_source(&original_source),
+            });
+            pending_files.len() - 1
+        };
+
+        let pending = &mut pending_files[pending_idx];
+        let mut hunk_results = Vec::with_capacity(patch.hunks.len());
+        let mut cumulative_line_delta = 0_i64;
+        let mut last_start_line = 0_u64;
+
+        for hunk in &patch.hunks {
+            if hunk.start_line == 0 {
+                return Err(anyhow!("patch hunks use 1-indexed line numbers"));
+            }
+            if hunk.start_line < last_start_line {
+                return Err(anyhow!(
+                    "patch hunks for `{}` must be sorted by start_line",
+                    rel_path
+                ));
+            }
+            last_start_line = hunk.start_line;
+
+            let applied_hunk = apply_patch_hunk(&mut pending.current, hunk, cumulative_line_delta)?;
+            cumulative_line_delta += applied_hunk.line_delta;
+            total_hunks_applied += 1;
+            hunk_results.push(json!({
+                "start_line": applied_hunk.start_line,
+                "applied_start_line": applied_hunk.applied_start_line,
+                "old_line_count": applied_hunk.old_line_count,
+                "new_line_count": applied_hunk.new_line_count,
+                "line_delta": applied_hunk.line_delta,
+                "diff_preview": applied_hunk.diff_preview
+            }));
+        }
+
+        results.push(json!({
+            "path": rel_path,
+            "hunks_applied": hunk_results.len(),
+            "line_delta": cumulative_line_delta,
+            "hunks": hunk_results
+        }));
+    }
+
+    let changed_files = pending_files
+        .iter()
+        .filter(|item| item.current != item.original)
+        .count() as u64;
+
+    if !dry_run {
+        for item in &pending_files {
+            if item.current != item.original {
+                let updated = item.current.to_source();
+                fs::write(&item.resolved, updated.as_bytes())
+                    .with_context(|| format!("failed to write {}", item.resolved.display()))?;
+            }
+        }
+    }
+
+    Ok(json!({
+        "results": results,
+        "applied": !dry_run,
+        "changed_files": changed_files,
+        "total_hunks_applied": total_hunks_applied
     }))
 }
 
@@ -731,6 +932,119 @@ fn build_diff_preview(original: &str, updated: &str, old_text: &str) -> String {
     format!("--- old\n{old_snippet}\n+++ new\n{new_snippet}")
 }
 
+fn apply_text_edit(
+    original: &str,
+    old_text: &str,
+    new_text: &str,
+    replace_all: bool,
+) -> Result<AppliedTextEdit> {
+    if old_text.is_empty() {
+        return Err(anyhow!("old_text must not be empty"));
+    }
+
+    let occurrences_found = original.matches(old_text).count() as u64;
+    if occurrences_found == 0 {
+        return Err(anyhow!("old_text not found in file"));
+    }
+    if !replace_all && occurrences_found > 1 {
+        return Err(anyhow!(
+            "old_text matches {} times; must match exactly once",
+            occurrences_found
+        ));
+    }
+
+    let replacements_applied = if replace_all { occurrences_found } else { 1 };
+    let updated = if replace_all {
+        original.replace(old_text, new_text)
+    } else {
+        original.replacen(old_text, new_text, 1)
+    };
+
+    Ok(AppliedTextEdit {
+        updated: updated.clone(),
+        occurrences_found,
+        replacements_applied,
+        diff_preview: build_diff_preview(original, &updated, old_text),
+    })
+}
+
+fn apply_patch_hunk(
+    buffer: &mut LineBuffer,
+    hunk: &PatchHunkRequest,
+    cumulative_line_delta: i64,
+) -> Result<AppliedPatchHunk> {
+    let adjusted_start = hunk.start_line as i64 - 1 + cumulative_line_delta;
+    if adjusted_start < 0 {
+        return Err(anyhow!(
+            "patch hunk at line {} shifted before the start of the file",
+            hunk.start_line
+        ));
+    }
+    let adjusted_start = adjusted_start as usize;
+
+    if hunk.old_lines.is_empty() {
+        if adjusted_start > buffer.lines.len() {
+            return Err(anyhow!(
+                "patch hunk insertion at line {} is beyond the end of the file",
+                hunk.start_line
+            ));
+        }
+    } else {
+        let adjusted_end = adjusted_start + hunk.old_lines.len();
+        if adjusted_end > buffer.lines.len() {
+            return Err(anyhow!(
+                "patch hunk at line {} extends beyond the end of the file",
+                hunk.start_line
+            ));
+        }
+
+        let actual = &buffer.lines[adjusted_start..adjusted_end];
+        if actual != hunk.old_lines.as_slice() {
+            return Err(anyhow!(
+                "patch hunk at line {} did not match file contents\nexpected:\n{}\nfound:\n{}",
+                hunk.start_line,
+                format_patch_lines(&hunk.old_lines),
+                format_patch_lines(actual)
+            ));
+        }
+    }
+
+    buffer.lines.splice(
+        adjusted_start..adjusted_start + hunk.old_lines.len(),
+        hunk.new_lines.iter().cloned(),
+    );
+
+    Ok(AppliedPatchHunk {
+        start_line: hunk.start_line,
+        applied_start_line: adjusted_start as u64 + 1,
+        old_line_count: hunk.old_lines.len() as u64,
+        new_line_count: hunk.new_lines.len() as u64,
+        line_delta: hunk.new_lines.len() as i64 - hunk.old_lines.len() as i64,
+        diff_preview: build_patch_hunk_preview(hunk.start_line, &hunk.old_lines, &hunk.new_lines),
+    })
+}
+
+fn build_patch_hunk_preview(start_line: u64, old_lines: &[String], new_lines: &[String]) -> String {
+    format!(
+        "@@ line {} @@\n--- old\n{}\n+++ new\n{}",
+        start_line,
+        format_patch_lines(old_lines),
+        format_patch_lines(new_lines)
+    )
+}
+
+fn format_patch_lines(lines: &[impl AsRef<str>]) -> String {
+    if lines.is_empty() {
+        "(empty)".to_string()
+    } else {
+        lines
+            .iter()
+            .map(|line| line.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 fn to_rel_path(repo_root: &Path, path: &Path) -> Result<String> {
     let rel = path.strip_prefix(repo_root).with_context(|| {
         format!(
@@ -748,6 +1062,74 @@ struct PreparedRead {
     start_line: u64,
     end_line: u64,
     requested_lines: u64,
+}
+
+#[derive(Debug)]
+struct PendingFileEdit {
+    resolved: PathBuf,
+    original: String,
+    current: String,
+}
+
+#[derive(Debug)]
+struct AppliedTextEdit {
+    updated: String,
+    occurrences_found: u64,
+    replacements_applied: u64,
+    diff_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineBuffer {
+    lines: Vec<String>,
+    has_trailing_newline: bool,
+}
+
+impl LineBuffer {
+    fn from_source(source: &str) -> Self {
+        if source.is_empty() {
+            return Self {
+                lines: Vec::new(),
+                has_trailing_newline: false,
+            };
+        }
+
+        let has_trailing_newline = source.ends_with('\n');
+        let mut lines = source.split('\n').map(str::to_string).collect::<Vec<_>>();
+        if has_trailing_newline {
+            lines.pop();
+        }
+
+        Self {
+            lines,
+            has_trailing_newline,
+        }
+    }
+
+    fn to_source(&self) -> String {
+        let mut source = self.lines.join("\n");
+        if self.has_trailing_newline && !self.lines.is_empty() {
+            source.push('\n');
+        }
+        source
+    }
+}
+
+#[derive(Debug)]
+struct PendingPatchedFile {
+    resolved: PathBuf,
+    original: LineBuffer,
+    current: LineBuffer,
+}
+
+#[derive(Debug)]
+struct AppliedPatchHunk {
+    start_line: u64,
+    applied_start_line: u64,
+    old_line_count: u64,
+    new_line_count: u64,
+    line_delta: i64,
+    diff_preview: String,
 }
 
 #[cfg(test)]
@@ -836,6 +1218,8 @@ mod tests {
         let dir = setup_repo();
         fs::write(dir.path().join("src/file.txt"), "hello").expect("file should be written");
         let value = file_outline(dir.path(), "src/file.txt", None).expect("outline should succeed");
+        assert_eq!(value["path"], "src/file.txt");
+        assert!(value["language"].is_null());
         assert_eq!(value["entries"].as_array().unwrap().len(), 0);
         assert_eq!(
             value["note"], "unsupported language for AST outline",
@@ -923,6 +1307,7 @@ mod tests {
         let value = edit_file_contents(dir.path(), "src/edit.rs", "1", "2", false)
             .expect("edit should succeed");
         assert_eq!(value["applied"], true);
+        assert_eq!(value["replacements_applied"], 1);
         assert_eq!(
             fs::read_to_string(dir.path().join("src/edit.rs")).expect("file should be readable"),
             "let a = 2;\n"
@@ -952,10 +1337,276 @@ mod tests {
         let value = edit_file_contents(dir.path(), "src/edit.rs", "hello", "bye", true)
             .expect("dry run should succeed");
         assert_eq!(value["applied"], false);
+        assert_eq!(value["replacements_applied"], 1);
         assert_eq!(
             fs::read_to_string(dir.path().join("src/edit.rs")).expect("file should be readable"),
             "hello\n"
         );
+    }
+
+    #[test]
+    fn test_batch_edit_file_contents_across_files() {
+        let dir = setup_repo();
+        fs::write(dir.path().join("src/a.rs"), "let a = 1;\n").expect("file should be written");
+        fs::write(dir.path().join("src/b.rs"), "let b = 2;\n").expect("file should be written");
+        let edits = vec![
+            BatchEditRequest {
+                path: "src/a.rs".to_string(),
+                old_text: "1".to_string(),
+                new_text: "10".to_string(),
+                replace_all: false,
+            },
+            BatchEditRequest {
+                path: "src/b.rs".to_string(),
+                old_text: "2".to_string(),
+                new_text: "20".to_string(),
+                replace_all: false,
+            },
+        ];
+
+        let value =
+            batch_edit_file_contents(dir.path(), &edits, false).expect("batch edit should succeed");
+        assert_eq!(value["applied"], true);
+        assert_eq!(value["changed_files"], 2);
+        assert_eq!(value["total_replacements_applied"], 2);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/a.rs")).expect("file should be readable"),
+            "let a = 10;\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/b.rs")).expect("file should be readable"),
+            "let b = 20;\n"
+        );
+    }
+
+    #[test]
+    fn test_batch_edit_file_contents_same_file_ordered() {
+        let dir = setup_repo();
+        fs::write(dir.path().join("src/edit.rs"), "alpha beta\n").expect("file should be written");
+        let edits = vec![
+            BatchEditRequest {
+                path: "src/edit.rs".to_string(),
+                old_text: "alpha".to_string(),
+                new_text: "gamma".to_string(),
+                replace_all: false,
+            },
+            BatchEditRequest {
+                path: "src/edit.rs".to_string(),
+                old_text: "gamma beta".to_string(),
+                new_text: "delta".to_string(),
+                replace_all: false,
+            },
+        ];
+
+        let value =
+            batch_edit_file_contents(dir.path(), &edits, false).expect("batch edit should succeed");
+        assert_eq!(value["changed_files"], 1);
+        assert_eq!(value["total_replacements_applied"], 2);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/edit.rs")).expect("file should be readable"),
+            "delta\n"
+        );
+    }
+
+    #[test]
+    fn test_batch_edit_file_contents_replace_all() {
+        let dir = setup_repo();
+        fs::write(dir.path().join("src/edit.rs"), "x x x\n").expect("file should be written");
+        let edits = vec![BatchEditRequest {
+            path: "src/edit.rs".to_string(),
+            old_text: "x".to_string(),
+            new_text: "y".to_string(),
+            replace_all: true,
+        }];
+
+        let value =
+            batch_edit_file_contents(dir.path(), &edits, false).expect("batch edit should succeed");
+        assert_eq!(value["total_replacements_applied"], 3);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/edit.rs")).expect("file should be readable"),
+            "y y y\n"
+        );
+    }
+
+    #[test]
+    fn test_batch_edit_file_contents_is_atomic_on_failure() {
+        let dir = setup_repo();
+        fs::write(dir.path().join("src/a.rs"), "let a = 1;\n").expect("file should be written");
+        fs::write(dir.path().join("src/b.rs"), "let b = 2;\n").expect("file should be written");
+        let edits = vec![
+            BatchEditRequest {
+                path: "src/a.rs".to_string(),
+                old_text: "1".to_string(),
+                new_text: "10".to_string(),
+                replace_all: false,
+            },
+            BatchEditRequest {
+                path: "src/b.rs".to_string(),
+                old_text: "missing".to_string(),
+                new_text: "20".to_string(),
+                replace_all: false,
+            },
+        ];
+
+        let result = batch_edit_file_contents(dir.path(), &edits, false);
+        assert!(result.is_err(), "batch edit should fail");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/a.rs")).expect("file should be readable"),
+            "let a = 1;\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/b.rs")).expect("file should be readable"),
+            "let b = 2;\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_patch_file_contents_replace_insert_and_delete() {
+        let dir = setup_repo();
+        fs::write(dir.path().join("src/edit.rs"), "one\ntwo\nthree\n")
+            .expect("file should be written");
+        let patches = vec![FilePatchRequest {
+            path: "src/edit.rs".to_string(),
+            hunks: vec![
+                PatchHunkRequest {
+                    start_line: 1,
+                    old_lines: vec![],
+                    new_lines: vec!["zero".to_string()],
+                },
+                PatchHunkRequest {
+                    start_line: 2,
+                    old_lines: vec!["two".to_string()],
+                    new_lines: vec!["TWO".to_string()],
+                },
+                PatchHunkRequest {
+                    start_line: 3,
+                    old_lines: vec!["three".to_string()],
+                    new_lines: vec![],
+                },
+            ],
+        }];
+
+        let value =
+            apply_patch_file_contents(dir.path(), &patches, false).expect("patch should succeed");
+        assert_eq!(value["applied"], true);
+        assert_eq!(value["changed_files"], 1);
+        assert_eq!(value["total_hunks_applied"], 3);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/edit.rs")).expect("file should be readable"),
+            "zero\none\nTWO\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_patch_file_contents_across_files() {
+        let dir = setup_repo();
+        fs::write(dir.path().join("src/a.rs"), "alpha\n").expect("file should be written");
+        fs::write(dir.path().join("src/b.rs"), "beta\n").expect("file should be written");
+        let patches = vec![
+            FilePatchRequest {
+                path: "src/a.rs".to_string(),
+                hunks: vec![PatchHunkRequest {
+                    start_line: 1,
+                    old_lines: vec!["alpha".to_string()],
+                    new_lines: vec!["ALPHA".to_string()],
+                }],
+            },
+            FilePatchRequest {
+                path: "src/b.rs".to_string(),
+                hunks: vec![PatchHunkRequest {
+                    start_line: 1,
+                    old_lines: vec!["beta".to_string()],
+                    new_lines: vec!["BETA".to_string()],
+                }],
+            },
+        ];
+
+        let value =
+            apply_patch_file_contents(dir.path(), &patches, false).expect("patch should succeed");
+        assert_eq!(value["changed_files"], 2);
+        assert_eq!(value["total_hunks_applied"], 2);
+    }
+
+    #[test]
+    fn test_apply_patch_file_contents_dry_run() {
+        let dir = setup_repo();
+        fs::write(dir.path().join("src/edit.rs"), "hello\n").expect("file should be written");
+        let patches = vec![FilePatchRequest {
+            path: "src/edit.rs".to_string(),
+            hunks: vec![PatchHunkRequest {
+                start_line: 1,
+                old_lines: vec!["hello".to_string()],
+                new_lines: vec!["bye".to_string()],
+            }],
+        }];
+
+        let value =
+            apply_patch_file_contents(dir.path(), &patches, true).expect("dry run should succeed");
+        assert_eq!(value["applied"], false);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/edit.rs")).expect("file should be readable"),
+            "hello\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_patch_file_contents_is_atomic_on_failure() {
+        let dir = setup_repo();
+        fs::write(dir.path().join("src/a.rs"), "alpha\n").expect("file should be written");
+        fs::write(dir.path().join("src/b.rs"), "beta\n").expect("file should be written");
+        let patches = vec![
+            FilePatchRequest {
+                path: "src/a.rs".to_string(),
+                hunks: vec![PatchHunkRequest {
+                    start_line: 1,
+                    old_lines: vec!["alpha".to_string()],
+                    new_lines: vec!["ALPHA".to_string()],
+                }],
+            },
+            FilePatchRequest {
+                path: "src/b.rs".to_string(),
+                hunks: vec![PatchHunkRequest {
+                    start_line: 1,
+                    old_lines: vec!["wrong".to_string()],
+                    new_lines: vec!["BETA".to_string()],
+                }],
+            },
+        ];
+
+        let result = apply_patch_file_contents(dir.path(), &patches, false);
+        assert!(result.is_err(), "patch should fail");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/a.rs")).expect("file should be readable"),
+            "alpha\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/b.rs")).expect("file should be readable"),
+            "beta\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_patch_file_contents_unsorted_hunks_error() {
+        let dir = setup_repo();
+        fs::write(dir.path().join("src/edit.rs"), "one\ntwo\n").expect("file should be written");
+        let patches = vec![FilePatchRequest {
+            path: "src/edit.rs".to_string(),
+            hunks: vec![
+                PatchHunkRequest {
+                    start_line: 2,
+                    old_lines: vec!["two".to_string()],
+                    new_lines: vec!["TWO".to_string()],
+                },
+                PatchHunkRequest {
+                    start_line: 1,
+                    old_lines: vec!["one".to_string()],
+                    new_lines: vec!["ONE".to_string()],
+                },
+            ],
+        }];
+
+        let result = apply_patch_file_contents(dir.path(), &patches, false);
+        assert!(result.is_err(), "unsorted hunks should fail");
     }
 
     #[test]
@@ -981,6 +1632,40 @@ mod tests {
             value["total_lines_returned"].as_u64().unwrap() >= 3,
             "should return expected lines"
         );
+    }
+
+    #[test]
+    fn test_multi_outline_basic() {
+        let dir = setup_repo();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "fn alpha() {}\nstruct Beta;\n",
+        )
+        .expect("file should be written");
+        fs::write(dir.path().join("src/file.txt"), "hello\n").expect("file should be written");
+        let requests = vec![
+            MultiOutlineRequest {
+                path: "src/lib.rs".to_string(),
+                max_depth: None,
+            },
+            MultiOutlineRequest {
+                path: "src/file.txt".to_string(),
+                max_depth: None,
+            },
+        ];
+
+        let value = multi_outline(dir.path(), &requests).expect("multi outline should succeed");
+        let results = value["results"]
+            .as_array()
+            .expect("results should be array");
+        assert_eq!(results.len(), 2);
+        assert_eq!(value["unsupported_files"], 1);
+        assert!(
+            value["total_entries"].as_u64().unwrap() >= 2,
+            "should count outlined definitions"
+        );
+        assert_eq!(results[0]["path"], "src/lib.rs");
+        assert_eq!(results[1]["path"], "src/file.txt");
     }
 
     #[test]
